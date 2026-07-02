@@ -1,0 +1,188 @@
+<?xml version='1.0'?>
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+
+<refentry id="trustctl" xmlns:xi="http://www.w3.org/2001/XInclude">
+
+  <refentryinfo>
+    <title>trustctl</title>
+    <productname>platformd</productname>
+  </refentryinfo>
+
+  <refmeta>
+    <refentrytitle>trustctl</refentrytitle>
+    <manvolnum>1</manvolnum>
+    <refmiscinfo class="source">platformd</refmiscinfo>
+    <refmiscinfo class="manual">platformd-trustd</refmiscinfo>
+  </refmeta>
+
+  <refnamediv>
+    <refname>trustctl</refname>
+    <refpurpose>Inspect the platform-authentication state and produce attestation</refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <cmdsynopsis>
+      <command>trustctl</command>
+      <arg choice="opt" rep="repeat">OPTIONS</arg>
+      <arg choice="req">COMMAND</arg>
+      <arg choice="opt" rep="repeat">ARGS</arg>
+    </cmdsynopsis>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title>Description</title>
+
+    <para><command>trustctl</command> inspects the platform-authentication state
+    maintained by
+    <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>,
+    evaluates its policies, and produces attestation. It is a client of the
+    <constant>io.platformd.Trust</constant>
+    <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
+    interface; the reading commands require no privilege, while attestation
+    requires access to the TPM and provisioning requires privilege to write the
+    boot reference.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Commands</title>
+
+    <para>The following commands are understood:</para>
+
+    <variablelist>
+      <varlistentry>
+        <term><command>status</command></term>
+        <listitem><para>Show the boot evidence and a summary of the
+        platform-authentication state.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>list-sessions</command></term>
+        <listitem><para>List the tracked login sessions with their lock and
+        verification state.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>session</command> <replaceable>ID</replaceable></term>
+        <listitem><para>Show the record for the session
+        <replaceable>ID</replaceable>, including the identity behind it and
+        whether that identity is verified.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>explain</command> <replaceable>POLICY</replaceable> <replaceable>ID</replaceable></term>
+        <listitem><para>Evaluate <replaceable>POLICY</replaceable> for the session
+        <replaceable>ID</replaceable> and print the result together with the reason
+        for it. The policies are <constant>fresh-user-verification</constant> (the
+        session is active, unlocked and was verified within the freshness window)
+        and <constant>local-trusted-session</constant> (in addition, the identity
+        is verified and the boot is <literal>verified-local</literal>). The result
+        is <literal>policy-satisfied</literal> or <literal>denied</literal>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>events</command></term>
+        <listitem><para>Show the recorded authentication events, most recent
+        first.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>pcrs</command></term>
+        <listitem><para>Show the measured-boot PCRs of the SHA-256 bank and the
+        boot grade.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>runtime-log</command></term>
+        <listitem><para>Show the runtime authentication measurement log: the
+        authentication and lock events folded into the extend-only TPM NV index,
+        with the baseline and current values needed to replay it.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>attest</command> <optional><replaceable>NONCE</replaceable></optional></term>
+        <listitem><para>Produce a TPM quote over the boot PCRs, bound to
+        <replaceable>NONCE</replaceable> (a hexadecimal string). If none is given a
+        random nonce is generated. The quote is verifiable against the attestation
+        key's public part without trusting the service.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>attest-token</command> <optional><replaceable>NONCE</replaceable></optional></term>
+        <listitem><para>Produce a complete attestation token in the Entity
+        Attestation Token format, bundling the quote, the boot measurements and the
+        runtime log.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>enroll</command></term>
+        <listitem><para>Show the enrollment evidence: the Endorsement Key public
+        key and, when present, its manufacturer certificate, together with the
+        Attestation Key public key and TPM name.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>activate-credential</command> <replaceable>CREDENTIAL</replaceable> <replaceable>SECRET</replaceable></term>
+        <listitem><para>Complete a credential-activation challenge, given the
+        credential blob and encrypted secret produced by a verifier's
+        <function>TPM2_MakeCredential</function> (both hexadecimal). The challenge
+        is recovered only if the attestation key and the Endorsement Key are
+        resident on this TPM, which proves the attestation key genuine.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>provision</command> <replaceable>UKI</replaceable></term>
+        <listitem><para>Compute the expected boot measurement from the sections of
+        the unified kernel image <replaceable>UKI</replaceable>, using
+        <citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
+        and record it as the boot reference. This is normally run by the
+        <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        plugin on each kernel installation.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Options</title>
+
+    <para>The following options are understood:</para>
+
+    <variablelist>
+      <varlistentry>
+        <term><option>-h</option></term>
+        <term><option>--help</option></term>
+        <listitem><para>Print a short help text and exit.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Exit status</title>
+    <para>On success 0 is returned, a non-zero failure code otherwise.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Environment</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><varname>$PLATFORMD_TRUSTD_RUNTIME</varname></term>
+        <listitem><para>The directory holding the
+        <constant>io.platformd.Trust</constant> socket. Defaults to
+        <filename>/run/platformd-trustd</filename>.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>See Also</title>
+
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>varlinkctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+    </simplelist></para>
+  </refsect1>
+
+</refentry>

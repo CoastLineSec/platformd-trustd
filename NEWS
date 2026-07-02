@@ -1,0 +1,17 @@
+platformd-trustd NEWS
+=====================
+
+platformd-trustd 0.0.1 (unreleased)
+
+  First milestone (T1, observability) of the platform-authentication state
+  authority. See docs/platform-trust.md.
+
+  * platformd-trustd: a system daemon that binds local boot identity and the
+    logind sessions into read-only records and serves them over the Varlink
+    interface io.platformd.Trust (GetBootEvidence, ListSessions,
+    GetSessionTrust). It observes; it gates nothing and holds no secret.
+  * trustctl: status, list-sessions, and session <id>.
+
+  Not yet implemented: session lock state and freshness (T2), the
+  pam_platformd.so authentication bridge (T3), boot measurement evidence — Secure
+  Boot and TPM/PCRs (T4), and the D-Bus state API (T5).
