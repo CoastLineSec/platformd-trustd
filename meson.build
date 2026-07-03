@@ -37,8 +37,11 @@ configure_file(
 # kernel-install plugin: record the boot reference on every UKI update, so
 # `trustctl provision` runs the systemd-measure prediction and trustd can grade
 # the boot verified-local. Runs after the UKI generator (lexicographic order).
+# kernel-install scans a fixed system path, so derive the directory from systemd's
+# own prefix (like the unit dir) rather than the build prefix.
+kernel_install_dir = systemd.found() ? systemd.get_variable(pkgconfig : 'prefix') / 'lib/kernel/install.d' : get_option('prefix') / 'lib/kernel/install.d'
 install_data(
         'units/70-platformd-trustd.install',
-        install_dir : get_option('prefix') / 'lib/kernel/install.d',
+        install_dir : kernel_install_dir,
         install_mode : 'rwxr-xr-x',
 )

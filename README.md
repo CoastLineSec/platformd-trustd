@@ -32,13 +32,15 @@ It provides three programs:
 ## Build
 
 ```sh
-meson setup build
+meson setup build --prefix=/usr
 ninja -C build
 sudo meson install -C build
 sudo systemctl enable --now platformd-trustd.service
 ```
 
-Binaries are produced under `build/src/trust/`.
+`--prefix=/usr` installs as a system component would expect (the daemon under
+`/usr/lib`, `trustctl` in `/usr/bin`, and the `kernel-install` plugin where
+`kernel-install` looks for it). Binaries are produced under `build/src/trust/`.
 
 ## Documentation
 
