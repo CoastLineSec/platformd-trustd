@@ -15,10 +15,9 @@ client, the state and policy models, and the security properties it does and doe
 not provide. Terms follow the `platformd` claim vocabulary — `observed`,
 `declared`, `measured`, `verified`, `policy-satisfied`, `trusted` — and default to
 `policy-satisfied`. Nothing here is `trusted` unless a trust root, policy, threat
-model, and enforcement mechanism are all named, and — because no code exists yet —
-nothing here is a current fact. This is a design reference; the
-[roadmap](#implementation-status) marks what any future build has actually
-delivered.
+model, and enforcement mechanism are all named. This is both a design reference and
+a record of what shipped; the [roadmap](#implementation-status) marks what the build
+has actually delivered.
 
 ## Overview
 
@@ -158,14 +157,14 @@ exact well-known name is an open decision (see [Naming](#naming)).
 
 ### The PAM bridge — `pam_platformd.so`
 
-A PAM module, the one component that *writes* to trustd. Placed in the greeter and
-locker PAM stacks, it converts successful (and, where useful, failed) PAM
-authentication, account, and session events into structured records and submits
-them over a private Varlink socket. It is observability-first: it does not verify
-passwords, does not replace `pam_unix` or `pam_systemd`, and declares the
-authentication method honestly (`password-pam-declared`, `fido2-pam-declared`,
-`fingerprint-pam-declared`, `unknown-pam-success`) rather than asserting a strength
-it cannot prove.
+A PAM module that records session establishment to trustd. Placed in the login and
+session PAM stacks, on `pam_sm_open_session` it submits a structured record that a
+session was established, over a private Varlink socket, declaring the method
+honestly (`password-pam-declared`, `fido2-pam-declared`, `fingerprint-pam-declared`,
+`unknown-pam-success`) rather than asserting a strength it cannot prove. It is
+observability-first: it does not verify passwords and does not replace `pam_unix` or
+`pam_systemd`. `platformd-verifyd` is the other writer, recording presence
+verifications.
 
 ### `trustctl`
 
@@ -205,8 +204,8 @@ trusted".
 ## State model
 
 trustd tracks records, not impressions. The five record types below are the
-concrete shape of the state it binds; fields are illustrative and will be pinned
-during implementation.
+concrete shape of the state it binds; fields are illustrative, and the
+implementation pins them.
 
 ### Boot-evidence record
 
@@ -298,12 +297,14 @@ Varlink, journal audit, a `*ctl` companion).
 
 Within platformd, trustd is the **trust oracle** the other components consume:
 
-- **`platformd-secretd`** is the first consumer. Its trust gate already tracks the
-  logind lock, grades caller identity, and enforces a freshness window — *locally*.
-  That logic is precisely the slice trustd centralizes; secretd's gate becomes a
-  thin client of trustd's `fresh-user-verification` / `credential-release-basic`
-  policies, and the seam it was built with (a single decision point in front of
-  every release) is where trustd plugs in.
+- **`platformd-secretd`** is the first consumer. A `trusted-platform` item is gated
+  on trustd's `local-trusted-session` verdict, consumed over Varlink; the seam
+  secretd was built with (a single decision point in front of every release) is
+  where trustd plugs in. Its local logind-lock, caller-grade, and freshness checks
+  remain for the session-scoped policies.
+- **`platformd-verifyd`** records presence verifications back into trustd — the
+  challenger to trustd's observer — so that a step-up refreshes the session's
+  freshness that a policy such as `local-trusted-session` requires.
 - Later consumers are polkit rules and `run0` (session-freshness-aware
   authorization), and QuickGlassShell (displaying honest session and boot state).
 
@@ -325,30 +326,30 @@ state accordingly and does not silently inherit a normal session's standing.
 
 ## Naming
 
-Open decisions to settle before code:
+How the implementation settled the naming, and the one item still open:
 
-- the D-Bus well-known name (`org.freedesktop.platform1` is the working
-  placeholder; it should read as the name systemd would use);
-- whether the first build ships the Varlink surface only (matching the
-  observability-first milestone) and defers D-Bus until a graphical consumer
-  exists;
-- the Varlink interface name (`io.platformd.Trust`, renaming to `io.systemd.Trust`
+- the Varlink interface is `io.platformd.Trust` (renaming to `io.systemd.Trust`
   under the project's rename test, consistent with systemd's `io.systemd.*`
-  Varlink interfaces).
+  Varlink interfaces);
+- the build ships the Varlink surface only, matching the observability-first
+  milestone, and defers D-Bus until a graphical consumer exists;
+- still open: the D-Bus well-known name (`org.freedesktop.platform1` is the working
+  placeholder; it should read as the name systemd would use), to be settled when
+  D-Bus lands.
 
 ## Implementation status
 
-No code exists yet; this document is the design that precedes it, exactly as
-`docs/secret-service.md` preceded `platformd-secretd`.
+`platformd-trustd` is built and released; this document is the design it was built
+to, kept in step as the code caught up to and then passed the roadmap below.
 
 | Milestone | Scope | State |
 | --- | --- | --- |
-| T1 | observability core: `platformd-trustd` claims the bus, records boot-id / machine-id / os-release, enumerates logind sessions, serves them over `io.platformd.Trust`, and `trustctl status` / `list-sessions` print them | planned |
-| T2 | session-trust records: lock state and freshness (the logind tracking generalized from `platformd-secretd`), the `fresh-user-verification` policy, and `platformd-secretd` consuming it | planned |
-| T3 | `pam_platformd.so` and authentication-event records; `trustctl events` | planned |
-| T4 | boot evidence: Secure Boot and TPM/PCR state recorded as `observed` / `measured`; the `*-after-accepted-boot` policy inputs | planned |
-| T5 | the D-Bus `org.freedesktop.platform1` state API and QuickGlassShell integration | planned |
-| T6+ | caller-identity generalization, a named policy engine, recovery-state handling, and (much later, only with a verifier) attestation | deferred |
+| T1 | observability core: `platformd-trustd` claims the bus, records boot-id / machine-id / os-release, enumerates logind sessions, serves them over `io.platformd.Trust`, and `trustctl status` / `list-sessions` print them | done |
+| T2 | session-trust records: lock state and freshness (the logind tracking generalized from `platformd-secretd`), the `fresh-user-verification` policy, and `platformd-secretd` consuming it | done |
+| T3 | `pam_platformd.so` and authentication-event records; `trustctl events` | done |
+| T4 | boot evidence: Secure Boot and TPM/PCR state recorded as `observed` / `measured` / `verified-local`, against a `kernel-install`-provisioned boot reference | done |
+| T5 | the D-Bus `org.freedesktop.platform1` state API and QuickGlassShell integration | deferred (the Varlink surface ships; D-Bus awaits a graphical consumer) |
+| T6+ | the `local-trusted-session` verdict, caller-identity grading, in-process verification of systemd-homed identities, an extend-only NV runtime log, an Entity Attestation Token, and attestation-key enrollment by credential activation | done; a generalized policy engine and recovery-state handling remain |
 
 The discipline is the platform-auth chain plan's: build observability before
 enforcement, never claim `trusted` without a documented basis, and let each record
