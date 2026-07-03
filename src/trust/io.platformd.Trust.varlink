@@ -83,7 +83,9 @@ type PolicyResult (
         windowSec: int
 )
 
-# Evaluate a named local policy for a session. Policies:
+# Evaluate a named local policy. Policies:
+#  - verified-boot: the boot matches the provisioned reference (verified-local).
+#    A platform property, evaluated without a session.
 #  - fresh-user-verification: session active, unlocked, and verified within windowSec.
 #  - local-trusted-session: fresh-user-verification AND a verified (homed Ed25519)
 #    identity AND a verified-local boot — the full local trust verdict.

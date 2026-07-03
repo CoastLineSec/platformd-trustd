@@ -29,13 +29,16 @@ trustd = executable(
 cc = meson.get_compiler('c')
 libpam = cc.find_library('pam', required : false)
 if libpam.found() and cc.has_header('security/pam_modules.h')
+        # PAM searches a fixed module directory (…/lib/security), so derive it from
+        # systemd's prefix, not the build prefix (as the kernel-install plugin does).
+        pam_moduledir = systemd.found() ? systemd.get_variable(pkgconfig : 'prefix') / 'lib/security' : get_option('libdir') / 'security'
         shared_library(
                 'pam_platformd',
                 'pam_platformd.c',
                 name_prefix : '',
                 dependencies : [libsystemd, libpam],
                 install : true,
-                install_dir : get_option('libdir') / 'security',
+                install_dir : pam_moduledir,
         )
 endif
 

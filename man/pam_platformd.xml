@@ -1,0 +1,121 @@
+<?xml version='1.0'?>
+<!DOCTYPE refentry PUBLIC "-//OASIS//DTD DocBook XML V4.5//EN"
+  "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
+<!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
+
+<refentry id="pam_platformd">
+
+  <refentryinfo>
+    <title>pam_platformd</title>
+    <productname>platformd</productname>
+  </refentryinfo>
+
+  <refmeta>
+    <refentrytitle>pam_platformd</refentrytitle>
+    <manvolnum>8</manvolnum>
+    <refmiscinfo class="source">platformd</refmiscinfo>
+    <refmiscinfo class="manual">platformd-trustd</refmiscinfo>
+  </refmeta>
+
+  <refnamediv>
+    <refname>pam_platformd</refname>
+    <refname>pam_platformd.so</refname>
+    <refpurpose>Record sessions with, and gate on, the platform trust authority</refpurpose>
+  </refnamediv>
+
+  <refsynopsisdiv>
+    <para><filename>pam_platformd.so</filename></para>
+  </refsynopsisdiv>
+
+  <refsect1>
+    <title>Description</title>
+
+    <para><filename>pam_platformd.so</filename> is the PAM interface to
+    <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
+    It has two roles, selected by its arguments and the module type it is stacked
+    as. It never verifies a credential itself and does not replace
+    <citerefentry project='man-pages'><refentrytitle>pam_unix</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+    or
+    <citerefentry><refentrytitle>pam_systemd</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+
+    <para>As a <option>session</option> module with <option>method=</option>, it is
+    an observer: on session open it submits a structured record (user, service, tty,
+    declared method) to the trust authority over Varlink and returns success. The
+    declared method is recorded as a declaration, never as a verified fact.</para>
+
+    <para>As an <option>auth</option> or <option>account</option> module with
+    <option>policy=</option>, it is a gate: it asks the trust authority to evaluate
+    the named policy for the caller's session and returns <constant>PAM_SUCCESS</constant>
+    if the policy is satisfied and <constant>PAM_AUTH_ERR</constant> otherwise. It
+    fails closed — if the authority cannot be reached, it denies. It authenticates
+    nobody; a stack uses it to route on platform state. The gate is advisory: it
+    reflects the <emphasis>observed</emphasis> platform state, not a hardware
+    boundary.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Options</title>
+
+    <variablelist>
+      <varlistentry>
+        <term><option>method=</option><replaceable>METHOD</replaceable></term>
+        <listitem><para>Used in a <option>session</option> line. The declared
+        authentication method to record, for example
+        <literal>fingerprint-pam-declared</literal>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><option>policy=</option><replaceable>POLICY</replaceable></term>
+        <listitem><para>Used in an <option>auth</option> or <option>account</option>
+        line. The trust policy to evaluate, for example
+        <literal>verified-boot</literal>. See
+        <citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        for the policy names.</para></listitem>
+      </varlistentry>
+    </variablelist>
+  </refsect1>
+
+  <refsect1>
+    <title>Module types provided</title>
+
+    <para>The <option>session</option> type records session establishment (with
+    <option>method=</option>). The <option>auth</option> and <option>account</option>
+    types provide the gate (with <option>policy=</option>). Without a recognised
+    argument the module returns <constant>PAM_IGNORE</constant>.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Example</title>
+
+    <para>Offer strong factors only on a verified boot, falling back to the password
+    otherwise. Place this in the <option>auth</option> section of a PAM service that
+    authenticates users — a screen locker, or <filename>polkit-1</filename>, which is
+    where run0 and other polkit escalations authenticate (run0's own stack has no
+    <option>auth</option> phase):</para>
+
+    <programlisting>auth  [success=ignore default=3]  pam_platformd.so  policy=verified-boot
+auth  sufficient  pam_fprintd.so
+auth  sufficient  pam_howdy.so
+auth  sufficient  pam_pin.so
+auth  required    pam_unix.so</programlisting>
+
+    <para>On a verified boot the gate returns success and the stack continues into
+    the strong factors; otherwise it denies and <literal>default=3</literal> jumps
+    the three of them to the password. Editing a live stack can lock you out — test
+    against a throwaway service with <command>pamtester</command> first, and keep a
+    root shell open. The installed <filename>platformd-gate.example</filename> walks
+    through both.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>See Also</title>
+
+    <para><simplelist type="inline">
+      <member><citerefentry><refentrytitle>platformd-trustd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>trustctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>pam.conf</refentrytitle><manvolnum>5</manvolnum></citerefentry></member>
+      <member><citerefentry project='man-pages'><refentrytitle>pam</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
+    </simplelist></para>
+  </refsect1>
+
+</refentry>

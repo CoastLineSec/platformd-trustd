@@ -18,7 +18,7 @@ It provides three programs:
 | --- | --- |
 | `platformd-trustd` | the daemon; maintains the state and serves it over the `io.platformd.Trust` Varlink interface |
 | `trustctl` | command-line client to inspect the state and produce attestation |
-| `pam_platformd.so` | PAM module that submits authentication events to the daemon |
+| `pam_platformd.so` | PAM module: records session events (`method=`), and gates a stack on a trust policy (`policy=`) |
 
 ## Requirements
 
@@ -39,8 +39,39 @@ sudo systemctl enable --now platformd-trustd.service
 ```
 
 `--prefix=/usr` installs as a system component would expect (the daemon under
-`/usr/lib`, `trustctl` in `/usr/bin`, and the `kernel-install` plugin where
-`kernel-install` looks for it). Binaries are produced under `build/src/trust/`.
+`/usr/lib`, `trustctl` in `/usr/bin`, the `kernel-install` plugin where
+`kernel-install` looks for it, and `pam_platformd.so` where PAM looks for it —
+`/usr/lib/security`). Binaries are produced under `build/src/trust/`.
+
+## Gating authentication on platform trust
+
+`pam_platformd.so` is placed in the PAM module directory by `meson install` — there
+is nothing to copy by hand. With a `policy=` argument it acts as a gate: it asks the
+daemon whether a policy holds (for example `verified-boot`, that the boot matches its
+provisioned reference) and returns success or failure, failing closed if the daemon
+is unreachable. It authenticates no one; a PAM stack uses it to *route* on platform
+state — offering strong factors only on a verified boot, say, and a password otherwise.
+
+Try it with no risk of a lockout, against a throwaway service and `pamtester`:
+
+```sh
+sudo pacman -S --needed pamtester
+sudo tee /etc/pam.d/platformd-gate-test >/dev/null <<'STACK'
+auth  [success=ignore default=1]  pam_platformd.so  policy=verified-boot
+auth  sufficient  pam_fprintd.so
+auth  required    pam_unix.so
+STACK
+pamtester platformd-gate-test "$USER" authenticate   # verified boot -> fingerprint
+sudo rm /etc/pam.d/platformd-gate-test
+```
+
+On a verified boot the gate passes and the fingerprint is offered; with the daemon
+stopped the same run falls straight to the password. To gate a real service, add the
+pattern to its `auth` section — see `pam/platformd-gate.example` (installed to
+`/usr/share/doc/platformd-trustd/`), keeping a root shell open while you test. Note
+run0 is not a target: it authenticates through polkit, so its stack is
+`/etc/pam.d/polkit-1`. The gate is advisory — it reflects the observed boot state,
+not a hardware boundary.
 
 ## Documentation
 
@@ -55,10 +86,15 @@ verification state, and the authentication events that established them. It
 verifies systemd-homed identities in-process against their Ed25519 signatures,
 folds runtime authentication events into an extend-only TPM NV index, and produces
 an Entity Attestation Token bundling the boot and runtime evidence. It evaluates
-the `fresh-user-verification` and `local-trusted-session` policies, grades the boot
-against a reference provisioned by a `kernel-install` plugin, and supports binding
-the attestation key to the TPM by credential activation. The state is served over
-the `io.platformd.Trust` Varlink interface and inspected with `trustctl`.
+the `verified-boot`, `fresh-user-verification`, and `local-trusted-session`
+policies, grades the boot against a reference provisioned by a `kernel-install`
+plugin, and supports binding the attestation key to the TPM by credential
+activation. Its PAM module both records session establishment and, given a
+`policy=` argument, gates a PAM stack on a policy — letting a screen locker or
+polkit stack offer strong factors only on a verified boot (see
+`pam/platformd-gate.example`). The state
+is served over the `io.platformd.Trust` Varlink interface and inspected with
+`trustctl`.
 
 ## License
 

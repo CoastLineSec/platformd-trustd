@@ -9,6 +9,7 @@ if xsltproc.found()
         manpages = [
                 ['trustctl', '1', []],
                 ['platformd-trustd.service', '8', ['platformd-trustd.8']],
+                ['pam_platformd', '8', []],
         ]
 
         xsltproc_flags = [

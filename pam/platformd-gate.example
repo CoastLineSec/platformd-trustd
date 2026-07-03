@@ -1,0 +1,47 @@
+# platformd-trustd authentication gate — reference stack.
+#
+# The pam_platformd.so module is installed for you by `meson install` into the PAM
+# module directory (…/lib/security) — you never copy it by hand. What remains is
+# telling a PAM service to consult it. This file is a reference you ADAPT; it is
+# not installed into /etc/pam.d, because editing a live auth stack can lock you out.
+#
+# ── What the gate does ───────────────────────────────────────────────────────
+#   `pam_platformd.so policy=<name>` asks platformd-trustd whether a policy holds
+#   (e.g. verified-boot = the boot matches its provisioned reference) and passes or
+#   fails — fail closed if trustd is unreachable. It authenticates no one; it only
+#   lets a stack *route* on platform state. It is advisory (it reflects the observed
+#   boot state), not a hardware boundary — a TPM-bound credential is the boundary.
+#
+# ── Step 1: see it work safely (no lockout risk) ─────────────────────────────
+#   Test against a throwaway service with pamtester, which touches nothing real:
+#
+#     sudo pacman -S --needed pamtester           # or your distro's package
+#     sudo tee /etc/pam.d/platformd-gate-test >/dev/null <<'STACK'
+#     auth  [success=ignore default=1]  pam_platformd.so  policy=verified-boot
+#     auth  sufficient  pam_fprintd.so
+#     auth  required    pam_unix.so
+#     STACK
+#     pamtester platformd-gate-test "$USER" authenticate    # verified boot -> reader
+#     sudo rm /etc/pam.d/platformd-gate-test
+#
+#   On a verified boot the gate passes and the fingerprint is offered; stop
+#   platformd-trustd and the same run falls straight to the password (fail closed).
+#
+# ── Step 2: gate a real service (know the blast radius first) ─────────────────
+#   Add the lines below to the *auth* section of a real service, keeping a root
+#   shell open while you test. run0 is NOT a target — it authenticates through
+#   polkit, so its auth lives in /etc/pam.d/polkit-1. Sensible targets:
+#
+#     /etc/pam.d/polkit-1   gates run0 and all polkit escalation (broad)
+#     your screen locker    e.g. /etc/pam.d/hyprlock (gentler: only unlock)
+#
+#   The pattern — set default=N to the number of strong factors that follow:
+#
+#     auth  [success=ignore default=3]  pam_platformd.so  policy=verified-boot
+#     auth  sufficient  pam_fprintd.so
+#     auth  sufficient  pam_howdy.so
+#     auth  sufficient  pam_pin.so
+#     auth  required    pam_unix.so
+#
+#   verified boot -> the strong factors; unverified (or trustd down) -> default=N
+#   jumps past them to the password.

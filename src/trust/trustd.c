@@ -622,10 +622,21 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
 
         if (!policy || !*policy)
                 return sd_varlink_error_invalid_parameter_name(link, "policy");
-        if (!streq(policy, "fresh-user-verification") && !streq(policy, "local-trusted-session"))
+        if (!streq(policy, "fresh-user-verification") && !streq(policy, "local-trusted-session") &&
+            !streq(policy, "verified-boot"))
                 return sd_varlink_error(link, "io.platformd.Trust.UnknownPolicy", NULL);
 
-        if (!sid || sd_session_get_uid(sid, &uid) < 0)
+        if (streq(policy, "verified-boot")) {
+                /* Boot integrity is a property of the platform, not a session: the
+                 * boot reference either matches or it does not. Advisory — a
+                 * compromised boot may misreport; the hard boundary is a TPM-bound
+                 * credential, not this policy. */
+                if (streq(current_boot_quality(), "verified-local")) {
+                        satisfied = true;
+                        reason = "boot matches the provisioned reference (verified-local)";
+                } else
+                        reason = "boot is not verified-local";
+        } else if (!sid || sd_session_get_uid(sid, &uid) < 0)
                 reason = "no such session";
         else {
                 TrackedSession *t = find_tracked(m, sid);

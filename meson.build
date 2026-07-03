@@ -17,6 +17,11 @@ add_project_arguments('-D_GNU_SOURCE', '-Wno-unused-parameter', language : 'c')
 # sd-event / sd-login / sd-journal, and sd-varlink / sd-json (>= 257).
 libsystemd = dependency('libsystemd', version : '>= 257')
 
+# systemd's pkg-config supplies the fixed system paths (unit dir, kernel-install
+# directory, PAM module dir) so installed integration lands where systemd and PAM
+# look, independent of the build prefix.
+systemd = dependency('systemd', required : false)
+
 subdir('src/trust')
 subdir('man')
 
@@ -24,7 +29,6 @@ subdir('man')
 conf = configuration_data()
 conf.set('LIBEXECDIR', get_option('prefix') / get_option('libexecdir'))
 
-systemd = dependency('systemd', required : false)
 systemd_system_unit_dir = systemd.found() ? systemd.get_variable(pkgconfig : 'systemdsystemunitdir') : get_option('prefix') / 'lib/systemd/system'
 configure_file(
         input : 'units/platformd-trustd.service.in',
@@ -44,4 +48,11 @@ install_data(
         'units/70-platformd-trustd.install',
         install_dir : kernel_install_dir,
         install_mode : 'rwxr-xr-x',
+)
+
+# Reference authentication-gate stack, installed as documentation only — never
+# into /etc/pam.d, where it could lock out an administrator. See the file's header.
+install_data(
+        'pam/platformd-gate.example',
+        install_dir : get_option('datadir') / 'doc' / 'platformd-trustd',
 )

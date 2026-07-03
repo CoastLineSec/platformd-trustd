@@ -166,6 +166,15 @@ observability-first: it does not verify passwords and does not replace `pam_unix
 `pam_systemd`. `platformd-verifyd` is the other writer, recording presence
 verifications.
 
+Given a `policy=` argument on an `auth` or `account` line instead, the same module
+acts as a **gate**: it asks trustd to evaluate that policy for the caller's session
+and returns success or failure — fail closed, so an unreachable authority denies.
+It authenticates nobody; a stack uses it to route on platform state, for example
+offering strong factors only on a `verified-boot` and otherwise falling back to a
+password (see `pam/platformd-gate.example`). The gate is advisory — it reflects the
+observed boot state, not a hardware boundary; a TPM-bound credential is the
+boundary.
+
 ### `trustctl`
 
 The inspector, in the shape of `loginctl` / `homectl`:
@@ -268,7 +277,11 @@ whether it is satisfied, and — always — why.
 ## Policy model
 
 Policies are named, explainable, and composed from records. A policy never returns
-a bare boolean; it returns a result plus the reason. Illustrative set:
+a bare boolean; it returns a result plus the reason. The implemented policies are
+`verified-boot` (the boot matches its provisioned reference; evaluated without a
+session), `fresh-user-verification` (an active, unlocked session verified within the
+window), and `local-trusted-session` (both of those plus a verified homed identity).
+The broader design space they are drawn from:
 
 - **`local-console-basic`** — an active local logind session, a successful PAM
   authentication event, and (for a homed user) an active home. Requires no boot

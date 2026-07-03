@@ -572,7 +572,7 @@ static void usage(void) {
                "  trustctl activate-credential <cred> <secret>  Answer a MakeCredential challenge\n"
                "  trustctl list-sessions            All tracked logind sessions\n"
                "  trustctl session <id>             One session's trust record\n"
-               "  trustctl explain <policy> <id>    Evaluate a named policy for a session\n"
+               "  trustctl explain <policy> [id]    Evaluate a named policy (id for session policies)\n"
                "  trustctl events                   Recent authentication events\n"
                "  trustctl runtime-log              Runtime auth measurement log (extend-only NV)\n"
                "  trustctl provision <uki>          Record the boot reference (kernel-install)\n");
@@ -587,8 +587,8 @@ int main(int argc, char *argv[]) {
                 return cmd_list_sessions();
         if (streq(cmd, "session") && argc > 2)
                 return cmd_session(argv[2]);
-        if (streq(cmd, "explain") && argc > 3)
-                return cmd_explain(argv[2], argv[3]);
+        if (streq(cmd, "explain") && argc > 2)
+                return cmd_explain(argv[2], argc > 3 ? argv[3] : "");
         if (streq(cmd, "events"))
                 return cmd_events();
         if (streq(cmd, "runtime-log"))
