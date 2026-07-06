@@ -40,9 +40,12 @@
     evaluates its policies, and produces attestation. It is a client of the
     <constant>io.platformd.Trust</constant>
     <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    interface; the reading commands require no privilege, while attestation
-    requires access to the TPM and provisioning requires privilege to write the
-    boot reference.</para>
+    interface; the reading commands require no privilege, while the attestation
+    commands (<command>attest</command>, <command>attest-token</command>,
+    <command>enroll</command>, <command>activate-credential</command>) must run as
+    root — the daemon restricts evidence production to root, as it is a signing
+    operation on the shared TPM — and <command>provision</command> requires
+    privilege to write the boot reference.</para>
   </refsect1>
 
   <refsect1>

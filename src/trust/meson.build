@@ -8,7 +8,7 @@ trustctl = executable(
         install : true,
 )
 
-# TPM2 attestation (T5b): built with tss2-esys when present, a stub otherwise.
+# TPM2 attestation: built with tss2-esys when present, a stub otherwise.
 tss2_esys = dependency('tss2-esys', required : false)
 tss2_mu = dependency('tss2-mu', required : false)
 # libcrypto: in-process Ed25519 verification of homed's signed user records.

@@ -51,10 +51,16 @@ if command -v varlinkctl >/dev/null 2>&1; then
         R=$(vc GetUserIdentity '{"uid":0}') || fail "GetUserIdentity errored: $R"
         echo "$R" | grep -q '"userName"' || fail "GetUserIdentity has no userName: $R"
 
-        # Attestation without a TPM: a clean error (or a quote if a TPM is present).
+        # Producing evidence is root-only. A non-root caller must be refused; for
+        # root it quotes, or errors cleanly without a TPM.
         R=$(vc Attest '{"nonceHex":"deadbeef"}' || true)
-        echo "$R" | grep -qE 'quotedHex|AttestationUnsupported|AttestationFailed' \
-                || fail "Attest neither quoted nor errored cleanly: $R"
+        if [ "$(id -u)" = "0" ]; then
+                echo "$R" | grep -qE 'quotedHex|AttestationUnsupported|AttestationFailed' \
+                        || fail "Attest (root) neither quoted nor errored cleanly: $R"
+        else
+                echo "$R" | grep -q 'PermissionDenied' \
+                        || fail "Attest from a non-root caller was not refused: $R"
+        fi
 
         R=$(vc GetRuntimeLog '{}') || fail "GetRuntimeLog errored: $R"
         echo "$R" | grep -q '"nvIndex"' || fail "GetRuntimeLog has no nvIndex: $R"

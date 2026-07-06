@@ -55,12 +55,16 @@ static int64_t jint(sd_json_variant *v, const char *key) {
 
 static sd_varlink *connect_trustd(void) {
         _cleanup_free_ char *addr = NULL;
+        const char *sock = getenv("PLATFORMD_TRUST_SOCKET");
         const char *dir = getenv("PLATFORMD_TRUSTD_RUNTIME");
         sd_varlink *link = NULL;
 
-        if (!dir || !*dir)
-                dir = "/run/platformd-trustd";
-        if (asprintf(&addr, "%s/io.platformd.Trust", dir) < 0)
+        /* Accept either an explicit socket path or a runtime directory. */
+        if (sock && *sock) {
+                if (!(addr = strdup(sock)))
+                        return NULL;
+        } else if (asprintf(&addr, "%s/io.platformd.Trust",
+                            dir && *dir ? dir : "/run/platformd-trustd") < 0)
                 return NULL;
         if (sd_varlink_connect_address(&link, addr) < 0) {
                 fprintf(stderr, "trustctl: no platform-authentication authority is running (%s)\n", addr);

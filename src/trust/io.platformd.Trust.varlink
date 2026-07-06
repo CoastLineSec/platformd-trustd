@@ -144,12 +144,12 @@ method GetRuntimeLog() -> (
         evidenceQuality: string
 )
 
-# Produce a TPM2 quote over the boot PCRs plus the runtime auth log (SHA-256,
-# 0..16 — PCR 16 is the GetRuntimeLog measurement), bound to nonceHex. Verifiable
+# Produce a TPM2 quote over the boot PCRs (SHA-256, 0..15; the runtime auth log
+# is certified separately from its NV index), bound to nonceHex. Verifiable
 # against akPublicHex without trusting trustd: check the signature over quotedHex,
 # that it carries the nonce, and that the attested PCR digest matches the values
 # from GetMeasuredBoot (or an eventLogHex replay). All fields are hex.
-# Requires TPM access — the daemon runs as root.
+# Restricted to root: producing evidence is a signing operation on the shared TPM.
 method Attest(nonceHex: string) -> (
         akPublicHex: string,
         quotedHex: string,
@@ -165,7 +165,7 @@ method Attest(nonceHex: string) -> (
 # the AK-signed TPM quote (the anchor), the boot PCRs + quality, and the runtime
 # auth log. `eat` is the serialized token a RATS Verifier consumes directly:
 # verify the quote against cnf, confirm the nonce, replay the PCRs/runtime log
-# against the quoted digest. format is the media type. Requires TPM access (root).
+# against the quoted digest. format is the media type. Restricted to root.
 method GetAttestationToken(nonceHex: string) -> (
         eat: string,
         format: string,
@@ -176,7 +176,7 @@ method GetAttestationToken(nonceHex: string) -> (
 # present in NV; empty otherwise), and the Attestation Key public + TPM name. A
 # verifier checks the EK cert (genuine TPM), then runs TPM2_MakeCredential over
 # ekPublicHex + akNameHex and challenges the daemon via ActivateCredential.
-# Requires TPM access (root).
+# Restricted to root.
 method GetEnrollment() -> (
         ekPublicHex: string,
         ekCertHex: string,
@@ -187,7 +187,7 @@ method GetEnrollment() -> (
 
 # Activate a verifier's credential (marshaled TPM2B_ID_OBJECT + TPM2B_ENCRYPTED_
 # SECRET, hex): the TPM recovers the challenge only if the AK and EK are on this
-# same TPM — proving the AK is genuine, not a software key. Requires TPM (root).
+# same TPM — proving the AK is genuine, not a software key. Restricted to root.
 method ActivateCredential(credentialHex: string, secretHex: string) -> (
         challengeHex: string,
         evidenceQuality: string

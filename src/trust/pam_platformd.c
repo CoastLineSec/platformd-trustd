@@ -73,14 +73,20 @@ static sd_json_variant *trustd_call(const char *method, sd_json_variant *params)
         _cleanup_free_ char *text = NULL, *buf = NULL;
         struct sockaddr_un sa = { .sun_family = AF_UNIX };
         struct timeval tv = { .tv_sec = 5 };
+        const char *sock = getenv("PLATFORMD_TRUST_SOCKET");
         const char *dir = getenv("PLATFORMD_TRUSTD_RUNTIME");
         sd_json_variant *reply = NULL;
         size_t buflen = 0, cap = 0, tlen;
-        int fd;
+        int fd, len;
 
-        if (!dir || !*dir)
-                dir = "/run/platformd-trustd";
-        if ((size_t) snprintf(sa.sun_path, sizeof sa.sun_path, "%s/io.platformd.Trust", dir) >= sizeof sa.sun_path)
+        /* Accept either an explicit socket path or a runtime directory (the two
+         * conventions used across the components), else the default location. */
+        if (sock && *sock)
+                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s", sock);
+        else
+                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s/io.platformd.Trust",
+                               dir && *dir ? dir : "/run/platformd-trustd");
+        if (len < 0 || (size_t) len >= sizeof sa.sun_path)
                 return NULL;
         if (sd_json_buildo(&envelope,
                 SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING(method)),
@@ -194,5 +200,9 @@ int pam_sm_setcred(pam_handle_t *pamh, int flags, int argc, const char **argv) {
 
 int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv) {
         const char *policy = arg_policy(argc, argv);
-        return policy ? gate(pamh, policy) : PAM_IGNORE;
+        if (!policy)
+                return PAM_IGNORE;
+        /* PAM_PERM_DENIED is the account-phase idiom for "this account may not
+         * proceed"; PAM_AUTH_ERR is for the auth phase. */
+        return gate(pamh, policy) == PAM_SUCCESS ? PAM_SUCCESS : PAM_PERM_DENIED;
 }

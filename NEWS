@@ -1,17 +1,55 @@
 platformd-trustd NEWS
 =====================
 
-platformd-trustd 0.0.1 (unreleased)
+platformd-trustd (unreleased)
 
-  First milestone (T1, observability) of the platform-authentication state
-  authority. See docs/platform-trust.md.
+  Audit hardening:
 
-  * platformd-trustd: a system daemon that binds local boot identity and the
-    logind sessions into read-only records and serves them over the Varlink
-    interface io.platformd.Trust (GetBootEvidence, ListSessions,
-    GetSessionTrust). It observes; it gates nothing and holds no secret.
-  * trustctl: status, list-sessions, and session <id>.
+  * Evidence-producing Varlink methods (Attest, GetAttestationToken,
+    GetEnrollment, ActivateCredential) are now restricted to root. Producing a
+    TPM quote or certification is a signing operation on a shared, slow device;
+    reading recorded state stays open to every local peer.
+  * The TCG event log is read to EOF rather than truncated at 64 KiB — a
+    truncated log cannot be replayed, so a short read now returns no log instead
+    of incomplete evidence.
+  * A session that already existed when the daemon started is recorded with its
+    freshness unknown ("never verified"), not fresh-as-of-now, so a daemon
+    restart no longer resets every session's freshness clock. Sessions observed
+    being created still start fresh (their creation is a successful auth).
+  * pam_platformd.so: the account-phase gate returns PAM_PERM_DENIED (the
+    account-phase idiom) rather than PAM_AUTH_ERR; the client accepts either a
+    runtime directory ($PLATFORMD_TRUSTD_RUNTIME) or a socket path
+    ($PLATFORMD_TRUST_SOCKET).
 
-  Not yet implemented: session lock state and freshness (T2), the
-  pam_platformd.so authentication bridge (T3), boot measurement evidence — Secure
-  Boot and TPM/PCRs (T4), and the D-Bus state API (T5).
+platformd-trustd 0.1.2
+
+  * pam_platformd.so gains a gate role: with a policy= argument on an auth or
+    account line it evaluates a trust policy and passes or fails (fail closed), so
+    a PAM stack can offer strong factors only on a verified boot. A verified-boot
+    policy is added to EvaluatePolicy. Reference stack in
+    pam/platformd-gate.example; documented in pam_platformd(8).
+
+platformd-trustd 0.1.1
+
+  * The kernel-install plugin is installed where kernel-install scans
+    (/usr/lib/kernel/install.d, derived from systemd's prefix), so the boot
+    reference is provisioned on each UKI update.
+
+platformd-trustd 0.1.0
+
+  * Full RATS Attester and local Verifier: verified-local boot graded against a
+    kernel-install-provisioned reference; in-process verification of
+    systemd-homed identities (Ed25519); an extend-only NV runtime auth log; a TPM
+    quote and an IETF Entity Attestation Token (RFC 9711) bundling boot and
+    runtime evidence; attestation-key enrollment by EK credential activation; and
+    the fresh-user-verification and local-trusted-session policies. Consumed by
+    platformd-secretd.
+
+platformd-trustd 0.0.1
+
+  * Observability core: boot identity and logind sessions as read-only records
+    over the Varlink interface io.platformd.Trust; trustctl status /
+    list-sessions / session.
+
+  Versioning: the 0.x series is pre-release. The 1.0 tag is gated on an
+  independent security review.

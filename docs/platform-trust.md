@@ -16,8 +16,8 @@ not provide. Terms follow the `platformd` claim vocabulary — `observed`,
 `declared`, `measured`, `verified`, `policy-satisfied`, `trusted` — and default to
 `policy-satisfied`. Nothing here is `trusted` unless a trust root, policy, threat
 model, and enforcement mechanism are all named. This is both a design reference and
-a record of what shipped; the [roadmap](#implementation-status) marks what the build
-has actually delivered.
+a record of what shipped; the [status](#status) section marks what the build has
+actually delivered.
 
 ## Overview
 
@@ -319,7 +319,7 @@ Within platformd, trustd is the **trust oracle** the other components consume:
   challenger to trustd's observer — so that a step-up refreshes the session's
   freshness that a policy such as `local-trusted-session` requires.
 - Later consumers are polkit rules and `run0` (session-freshness-aware
-  authorization), and QuickGlassShell (displaying honest session and boot state).
+  authorization), and a desktop shell displaying honest session and boot state.
 
 ## Threat model and known limits
 
@@ -337,6 +337,20 @@ policy that depended on the missing property returns denied with that reason. A
 recovery boot, a LUKS recovery key, or a homed password reset marks the session
 state accordingly and does not silently inherit a normal session's standing.
 
+Two honesty notes on the freshness signal. First, a session's freshness comes from
+logind's `Unlock` signal (a screen unlock is treated as a fresh user verification);
+root can emit that signal with `loginctl unlock-session` without a human, so
+freshness is only as trustworthy as the exclusion of local root, which the threat
+model already excludes. Second, freshness is observed, not persisted: a session
+that already existed when the daemon started is recorded as never-verified until it
+is next unlocked, so a restart never manufactures freshness.
+
+Producing attestation evidence is privileged. `Attest`, `GetAttestationToken`,
+`GetEnrollment`, and `ActivateCredential` are restricted to root — each is a
+signing operation on the shared TPM, and leaving them open to every local peer
+would let any user monopolize the device and stall the daemon. Reading recorded
+state (boot evidence, sessions, the verdict, the runtime log) stays open to all.
+
 ## Naming
 
 How the implementation settled the naming, and the one item still open:
@@ -345,25 +359,30 @@ How the implementation settled the naming, and the one item still open:
   under the project's rename test, consistent with systemd's `io.systemd.*`
   Varlink interfaces);
 - the build ships the Varlink surface only, matching the observability-first
-  milestone, and defers D-Bus until a graphical consumer exists;
+  approach, and defers D-Bus until a graphical consumer exists;
 - still open: the D-Bus well-known name (`org.freedesktop.platform1` is the working
   placeholder; it should read as the name systemd would use), to be settled when
   D-Bus lands.
 
-## Implementation status
+## Status
 
-`platformd-trustd` is built and released; this document is the design it was built
-to, kept in step as the code caught up to and then passed the roadmap below.
+`platformd-trustd` is built and released. It serves the full `io.platformd.Trust`
+Varlink surface:
 
-| Milestone | Scope | State |
-| --- | --- | --- |
-| T1 | observability core: `platformd-trustd` claims the bus, records boot-id / machine-id / os-release, enumerates logind sessions, serves them over `io.platformd.Trust`, and `trustctl status` / `list-sessions` print them | done |
-| T2 | session-trust records: lock state and freshness (the logind tracking generalized from `platformd-secretd`), the `fresh-user-verification` policy, and `platformd-secretd` consuming it | done |
-| T3 | `pam_platformd.so` and authentication-event records; `trustctl events` | done |
-| T4 | boot evidence: Secure Boot and TPM/PCR state recorded as `observed` / `measured` / `verified-local`, against a `kernel-install`-provisioned boot reference | done |
-| T5 | the D-Bus `org.freedesktop.platform1` state API and QuickGlassShell integration | deferred (the Varlink surface ships; D-Bus awaits a graphical consumer) |
-| T6+ | the `local-trusted-session` verdict, caller-identity grading, in-process verification of systemd-homed identities, an extend-only NV runtime log, an Entity Attestation Token, and attestation-key enrollment by credential activation | done; a generalized policy engine and recovery-state handling remain |
+- boot evidence — firmware, Secure Boot, and the TPM PCR bank, graded `observed` /
+  `measured` / `verified-local` against a `kernel-install`-provisioned boot reference;
+- logind session records with lock state and verification freshness;
+- authentication-event records (from `pam_platformd.so`) and a runtime auth log
+  folded into an extend-only TPM NV index;
+- verified user identity, checked in-process against systemd-homed's Ed25519
+  signatures;
+- named policies — `fresh-user-verification`, `local-trusted-session`, `verified-boot`;
+- attestation — a TPM quote, an IETF Entity Attestation Token bundling the boot and
+  runtime evidence, and attestation-key enrollment by EK credential activation.
 
-The discipline is the platform-auth chain plan's: build observability before
-enforcement, never claim `trusted` without a documented basis, and let each record
-be only as strong as its evidence.
+Deferred: a D-Bus state API for a graphical consumer (the Varlink surface ships
+today); a generalized policy engine and recovery-state handling.
+
+The discipline throughout: build observability before enforcement, never claim
+`trusted` without a documented basis, and let each record be only as strong as its
+evidence.

@@ -2,13 +2,12 @@
 /*
  * platformd-trustd — the platform-authentication state authority.
  *
- * T1 (observability): binds boot identity and the logind sessions into read-only
- * records served over the Varlink interface io.platformd.Trust.
- * T2 (session state): tracks per-session lock state and verification freshness
- * from systemd-logind, and answers the fresh-user-verification policy.
- *
- * It authenticates nothing, gates nothing, and holds no secret; it observes and
- * reports. See docs/platform-trust.md.
+ * Binds boot evidence, the logind sessions, user identity, and authentication
+ * events into read-only records served over the Varlink interface
+ * io.platformd.Trust, and evaluates named policies over them (fresh-user-
+ * verification, local-trusted-session, verified-boot). It authenticates nothing,
+ * gates nothing, and holds no secret; it observes and reports. It also produces
+ * TPM-based attestation of the boot and runtime state. See docs/platform-trust.md.
  */
 
 #include <errno.h>
@@ -99,7 +98,7 @@ static uint64_t now_real(void) {
 
 /* Fold a runtime auth/lock event into trustd's extend-only NV index and append it
  * to the measurement log. The NV value is later AK-certified, binding "user X
- * authenticated on this attested boot" to the TPM — the platform-auth novelty. */
+ * authenticated on this attested boot" to the TPM. */
 static void record_runtime_event(Manager *m, const char *desc) {
         RuntimeEvent *e;
         uint8_t value[32];
@@ -129,7 +128,7 @@ static int64_t seconds_since_verify(const TrackedSession *t) {
         return (int64_t) ((now_mono() - t->last_verify) / 1000000);
 }
 
-/* --- boot evidence (T1) ------------------------------------------------------ */
+/* --- boot evidence ----------------------------------------------------------- */
 
 static char *read_os_release_field(const char *key) {
         FILE *f;
@@ -336,7 +335,7 @@ static int vl_get_measured_boot(sd_varlink *link, sd_json_variant *parameters,
         return sd_varlink_reply(link, result);
 }
 
-/* --- session tracking (T2) --------------------------------------------------- */
+/* --- session tracking -------------------------------------------------------- */
 
 static TrackedSession *find_tracked(Manager *m, const char *id) {
         for (TrackedSession *s = m->sessions; s; s = s->next)
@@ -352,7 +351,12 @@ static TrackedSession *find_tracked_by_path(Manager *m, const char *path) {
         return NULL;
 }
 
-static void track_session(Manager *m, const char *id, const char *path, bool locked) {
+/* `adopted` marks a session that already existed when the daemon started, versus
+ * one we observed being created. A session's creation IS a successful
+ * authentication, so a freshly-created unlocked session starts fresh; but for an
+ * adopted session the last verification was never observed, so its honest record
+ * is "never" — a daemon restart must not silently reset everyone's freshness. */
+static void track_session(Manager *m, const char *id, const char *path, bool locked, bool adopted) {
         TrackedSession *s;
 
         if (find_tracked(m, id))
@@ -367,7 +371,7 @@ static void track_session(Manager *m, const char *id, const char *path, bool loc
                 return;
         }
         s->locked = locked;
-        s->last_verify = locked ? 0 : now_mono();   /* unlocked at first sight = fresh */
+        s->last_verify = (locked || adopted) ? 0 : now_mono();
         s->next = m->sessions;
         m->sessions = s;
 }
@@ -384,7 +388,7 @@ static void untrack_by_path(Manager *m, const char *path) {
                 }
 }
 
-/* --- verified identity via userdb (bottom-up base #1) ------------------------ */
+/* --- verified identity via userdb -------------------------------------------- */
 
 /* Query systemd-userdbd's homed-exclusive source for a uid's record. A signed
  * record means homed vouches for the identity with an Ed25519 key (verified);
@@ -473,7 +477,7 @@ static int userdb_query_identity(uid_t uid, bool *verified, char **source, char 
         return 0;
 }
 
-/* --- session records (T1 basics + T2 lock/freshness + verified identity) ----- */
+/* --- session records --------------------------------------------------------- */
 
 static int session_to_json(Manager *m, const char *id, sd_json_variant **ret) {
         _cleanup_free_ char *seat = NULL, *type = NULL, *class = NULL, *state = NULL, *tty = NULL;
@@ -601,7 +605,7 @@ static int vl_get_user_identity(sd_varlink *link, sd_json_variant *parameters,
         return sd_varlink_reply(link, result);
 }
 
-/* --- policy (T2) ------------------------------------------------------------- */
+/* --- policy ------------------------------------------------------------------ */
 
 static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
                               sd_varlink_method_flags_t flags, void *userdata) {
@@ -688,7 +692,7 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
         return sd_varlink_reply(link, result);
 }
 
-/* --- logind tracking (T2) ---------------------------------------------------- */
+/* --- logind tracking --------------------------------------------------------- */
 
 static int on_lock(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
         TrackedSession *t = find_tracked_by_path(userdata, sd_bus_message_get_path(msg));
@@ -751,7 +755,7 @@ static int on_props(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
 static int on_session_new(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
         const char *id, *path;
         if (sd_bus_message_read(msg, "so", &id, &path) >= 0)
-                track_session(userdata, id, path, false);
+                track_session(userdata, id, path, false, false);   /* observed creation = fresh */
         return 0;
 }
 
@@ -785,7 +789,7 @@ static void setup_logind(Manager *m) {
                         locked = 0;
                         (void) sd_bus_get_property_trivial(m->bus, "org.freedesktop.login1", path,
                                         "org.freedesktop.login1.Session", "LockedHint", NULL, 'b', &locked);
-                        track_session(m, id, path, locked > 0);
+                        track_session(m, id, path, locked > 0, true);   /* adopted: freshness unknown */
                 }
                 (void) sd_bus_message_exit_container(reply);
         }
@@ -804,7 +808,7 @@ static void setup_logind(Manager *m) {
         sd_journal_print(LOG_INFO, "tracking logind session lock state and freshness");
 }
 
-/* --- authentication events (T3) ---------------------------------------------- */
+/* --- authentication events --------------------------------------------------- */
 
 #define AUTH_EVENTS_MAX 64
 
@@ -956,7 +960,17 @@ static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
         return sd_varlink_reply(link, result);
 }
 
-/* --- attestation (T5b) ------------------------------------------------------- */
+/* --- attestation ------------------------------------------------------------- */
+
+/* Producing evidence — a TPM quote, an NV certification, a credential activation
+ * — is a signing operation on a shared, slow device; left open to every local
+ * peer it would let any user monopolize the TPM and stall the daemon (and with
+ * it every PAM gate check). Reading recorded state stays open to all; producing
+ * fresh evidence is privileged. */
+static bool peer_is_root(sd_varlink *link) {
+        uid_t peer;
+        return sd_varlink_get_peer_uid(link, &peer) >= 0 && peer == 0;
+}
 
 static char *hex_encode(const uint8_t *b, size_t n) {
         static const char digits[] = "0123456789abcdef";
@@ -1000,22 +1014,42 @@ static int hex_decode(const char *hex, uint8_t **out, size_t *out_len) {
 }
 
 /* The TCG event log (securityfs, root-readable) so a verifier can replay it to
- * the PCR values. Returns a hex string (malloc'd), or NULL when unavailable. */
+ * the PCR values. Read to EOF — the log is often larger than one buffer, and a
+ * truncated log cannot be replayed, so a short read returns NULL rather than
+ * incomplete evidence. Returns a hex string (malloc'd), or NULL when unavailable. */
+#define EVENT_LOG_MAX (4u * 1024 * 1024)
+
 static char *read_event_log_hex(void) {
         _cleanup_free_ uint8_t *buf = NULL;
+        size_t len = 0, cap = 0;
         FILE *f;
-        size_t n;
 
         f = fopen("/sys/kernel/security/tpm0/binary_bios_measurements", "re");
         if (!f)
                 return NULL;
-        if (!(buf = malloc(65536))) {
-                fclose(f);
-                return NULL;
+        for (;;) {
+                size_t n;
+
+                if (len == cap) {
+                        uint8_t *nb = realloc(buf, cap += 65536);
+                        if (!nb) {
+                                fclose(f);
+                                return NULL;
+                        }
+                        buf = nb;
+                }
+                n = fread(buf + len, 1, cap - len, f);
+                len += n;
+                if (n == 0) {   /* EOF or error — only a clean EOF is complete evidence */
+                        bool complete = feof(f) != 0;
+                        fclose(f);
+                        return complete ? hex_encode(buf, len) : NULL;
+                }
+                if (len > EVENT_LOG_MAX) {
+                        fclose(f);
+                        return NULL;
+                }
         }
-        n = fread(buf, 1, 65536, f);
-        fclose(f);
-        return hex_encode(buf, n);
 }
 
 static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
@@ -1026,6 +1060,9 @@ static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
         size_t nonce_len = 0, ak_len = 0, quoted_len = 0, sig_len = 0;
         sd_json_variant *p;
         int r;
+
+        if (!peer_is_root(link))
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         p = sd_json_variant_by_key(parameters, "nonceHex");
         if (!p || !sd_json_variant_is_string(p) ||
@@ -1081,6 +1118,9 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
         sd_id128_t machine;
         sd_json_variant *p;
         int r;
+
+        if (!peer_is_root(link))
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         p = sd_json_variant_by_key(parameters, "nonceHex");
         if (!p || !sd_json_variant_is_string(p) ||
@@ -1199,6 +1239,9 @@ static int vl_get_enrollment(sd_varlink *link, sd_json_variant *parameters,
         size_t ek_len = 0, ek_cert_len = 0, ak_len = 0, ak_name_len = 0;
         int r;
 
+        if (!peer_is_root(link))
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
+
         r = attest_get_enrollment(&ek, &ek_len, &ek_cert, &ek_cert_len,
                                   &ak, &ak_len, &ak_name, &ak_name_len);
         if (r == -ENOTSUP)
@@ -1232,6 +1275,9 @@ static int vl_activate_credential(sd_varlink *link, sd_json_variant *parameters,
         size_t cred_len = 0, secret_len = 0, challenge_len = 0;
         sd_json_variant *pc, *ps;
         int r;
+
+        if (!peer_is_root(link))
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         pc = sd_json_variant_by_key(parameters, "credentialHex");
         ps = sd_json_variant_by_key(parameters, "secretHex");
