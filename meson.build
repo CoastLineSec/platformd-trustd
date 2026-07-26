@@ -38,7 +38,7 @@ configure_file(
         install_dir : systemd_system_unit_dir,
 )
 
-# kernel-install plugin: record the boot reference on every UKI update, so
+# kernel-install plugin: maintain a boot reference for every installed UKI, so
 # `trustctl provision` runs the systemd-measure prediction and trustd can grade
 # the boot verified-local. Runs after the UKI generator (lexicographic order).
 # kernel-install scans a fixed system path, so derive the directory from systemd's

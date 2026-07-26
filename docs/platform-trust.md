@@ -343,7 +343,9 @@ root can emit that signal with `loginctl unlock-session` without a human, so
 freshness is only as trustworthy as the exclusion of local root, which the threat
 model already excludes. Second, freshness is observed, not persisted: a session
 that already existed when the daemon started is recorded as never-verified until it
-is next unlocked, so a restart never manufactures freshness.
+is next unlocked, so a restart never manufactures freshness. Freshness uses a
+suspend-aware clock and is invalidated before sleep, so time spent suspended
+cannot preserve a pre-suspend verification.
 
 Producing attestation evidence is privileged. `Attest`, `GetAttestationToken`,
 `GetEnrollment`, and `ActivateCredential` are restricted to root — each is a
@@ -370,7 +372,8 @@ How the implementation settled the naming, and the one item still open:
 Varlink surface:
 
 - boot evidence — firmware, Secure Boot, and the TPM PCR bank, graded `observed` /
-  `measured` / `verified-local` against a `kernel-install`-provisioned boot reference;
+  `measured` / `verified-local` against the references retained for installed
+  boot entries by `kernel-install`;
 - logind session records with lock state and verification freshness;
 - authentication-event records (from `pam_platformd.so`) and a runtime auth log
   folded into an extend-only TPM NV index;

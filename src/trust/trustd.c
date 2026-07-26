@@ -10,6 +10,7 @@
  * TPM-based attestation of the boot and runtime state. See docs/platform-trust.md.
  */
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <pwd.h>
@@ -51,7 +52,7 @@ typedef struct TrackedSession {
         char *id;
         char *path;               /* login1 session object path */
         bool locked;
-        uint64_t last_verify;     /* CLOCK_MONOTONIC us of last unlock/creation; 0 = never */
+        uint64_t last_verify;     /* CLOCK_BOOTTIME us of last unlock/creation; 0 = never */
 } TrackedSession;
 
 typedef struct AuthEvent {
@@ -76,15 +77,16 @@ typedef struct Manager {
         AuthEvent *events;
         RuntimeEvent *runtime_log, *runtime_tail;
         unsigned n_events, n_runtime;
+        bool runtime_log_incomplete;
         char baseline_runtime[65];  /* NV log value before trustd's extensions this boot */
         uint64_t fresh_window;    /* seconds; the fresh-user-verification window */
 } Manager;
 
 static Manager *manager_instance;
 
-static uint64_t now_mono(void) {
+static uint64_t now_boottime(void) {
         struct timespec ts;
-        clock_gettime(CLOCK_MONOTONIC, &ts);
+        clock_gettime(CLOCK_BOOTTIME, &ts);
         return (uint64_t) ts.tv_sec * 1000000 + (uint64_t) ts.tv_nsec / 1000;
 }
 
@@ -103,13 +105,27 @@ static void record_runtime_event(Manager *m, const char *desc) {
         RuntimeEvent *e;
         uint8_t value[32];
 
-        if (m->n_runtime >= RUNTIME_LOG_MAX)
+        if (m->n_runtime >= RUNTIME_LOG_MAX) {
+                if (!m->runtime_log_incomplete)
+                        sd_journal_print(LOG_ERR, "runtime measurement log limit reached");
+                m->runtime_log_incomplete = true;
                 return;
-        if (attest_nv_extend((const uint8_t *) desc, strlen(desc), value) < 0)
-                return;   /* no TPM access — the event is simply not measured */
-        if (!(e = calloc(1, sizeof *e)))
+        }
+
+        if (!(e = calloc(1, sizeof *e)) || !(e->desc = strdup(desc))) {
+                free(e);
+                m->runtime_log_incomplete = true;
+                sd_journal_print(LOG_ERR, "failed to allocate runtime measurement event");
                 return;
-        e->desc = strdup(desc);
+        }
+        if (attest_nv_extend((const uint8_t *) desc, strlen(desc), value) < 0) {
+                free(e->desc);
+                free(e);
+                m->runtime_log_incomplete = true;
+                sd_journal_print(LOG_WARNING, "failed to extend runtime measurement");
+                return;
+        }
+
         for (int i = 0; i < 32; i++)
                 snprintf(e->digest + 2 * i, 3, "%02x", value[i]);
         e->when = now_real();
@@ -125,7 +141,7 @@ static void record_runtime_event(Manager *m, const char *desc) {
 static int64_t seconds_since_verify(const TrackedSession *t) {
         if (!t || t->last_verify == 0)
                 return -1;
-        return (int64_t) ((now_mono() - t->last_verify) / 1000000);
+        return (int64_t) ((now_boottime() - t->last_verify) / 1000000);
 }
 
 /* --- boot evidence ----------------------------------------------------------- */
@@ -228,17 +244,13 @@ static const char *trust_state_dir(void) {
         return d;
 }
 
-/* Does the live PCR 11 match a value in the provisioned boot reference? The
- * reference is written by `trustctl provision` (root-owned) on each UKI update. */
-static bool boot_reference_matches(const char *live_pcr11) {
+static bool boot_reference_file_matches(const char *path, const char *live_pcr11) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *ref = NULL;
-        _cleanup_free_ char *path = NULL, *buf = NULL;
+        _cleanup_free_ char *buf = NULL;
         sd_json_variant *arr;
         long sz;
         FILE *f;
 
-        if (!*live_pcr11 || asprintf(&path, "%s/boot-reference.json", trust_state_dir()) < 0)
-                return false;
         if (!(f = fopen(path, "re")))
                 return false;
         if (fseek(f, 0, SEEK_END) != 0 || (sz = ftell(f)) <= 0 || sz > 1048576) {
@@ -262,6 +274,48 @@ static bool boot_reference_matches(const char *live_pcr11) {
                 if (e && sd_json_variant_is_string(e) && strcasecmp(sd_json_variant_string(e), live_pcr11) == 0)
                         return true;
         }
+        return false;
+}
+
+/* Does the live PCR 11 match any root-provisioned UKI reference? Keep accepting
+ * the original single-file location while installations migrate to the
+ * per-entry boot-references directory. */
+static bool boot_reference_matches(const char *live_pcr11) {
+        _cleanup_free_ char *legacy = NULL, *dirpath = NULL;
+        DIR *dir;
+
+        if (!live_pcr11 || !*live_pcr11)
+                return false;
+
+        if (asprintf(&legacy, "%s/boot-reference.json", trust_state_dir()) >= 0 &&
+            boot_reference_file_matches(legacy, live_pcr11))
+                return true;
+
+        if (asprintf(&dirpath, "%s/boot-references", trust_state_dir()) < 0)
+                return false;
+        if (!(dir = opendir(dirpath)))
+                return false;
+
+        for (;;) {
+                _cleanup_free_ char *path = NULL;
+                struct dirent *de;
+                size_t l;
+
+                errno = 0;
+                if (!(de = readdir(dir)))
+                        break;
+                l = strlen(de->d_name);
+                if (de->d_name[0] == '.' || l <= 5 || !streq(de->d_name + l - 5, ".json"))
+                        continue;
+                if (asprintf(&path, "%s/%s", dirpath, de->d_name) < 0)
+                        continue;
+                if (boot_reference_file_matches(path, live_pcr11)) {
+                        closedir(dir);
+                        return true;
+                }
+        }
+
+        closedir(dir);
         return false;
 }
 
@@ -371,7 +425,7 @@ static void track_session(Manager *m, const char *id, const char *path, bool loc
                 return;
         }
         s->locked = locked;
-        s->last_verify = (locked || adopted) ? 0 : now_mono();
+        s->last_verify = (locked || adopted) ? 0 : now_boottime();
         s->next = m->sessions;
         m->sessions = s;
 }
@@ -661,19 +715,28 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
                         satisfied = true;
                         reason = "session active and unlocked, verified within the window";
                 } else if (fresh) {
-                        /* local-trusted-session also needs a verified identity + boot. */
+                        /* local-trusted-session also needs a local session,
+                         * verified identity, and verified boot. */
                         _cleanup_free_ char *usrc = NULL, *ukey = NULL;
                         const char *bq = current_boot_quality();
+                        int remote;
                         bool uverified = false;
 
-                        (void) userdb_query_identity(uid, &uverified, &usrc, &ukey);
-                        if (!uverified)
-                                reason = "user identity is not verified (not a homed user)";
-                        else if (!streq(bq, "verified-local"))
-                                reason = "boot is only measured, not verified";
+                        remote = sd_session_is_remote(sid);
+                        if (remote < 0)
+                                reason = "session locality is unknown";
+                        else if (remote > 0)
+                                reason = "session is remote";
                         else {
-                                satisfied = true;
-                                reason = "verified identity on a verified-local boot, session fresh and unlocked";
+                                (void) userdb_query_identity(uid, &uverified, &usrc, &ukey);
+                                if (!uverified)
+                                        reason = "user identity is not verified (not a homed user)";
+                                else if (!streq(bq, "verified-local"))
+                                        reason = "boot is only measured, not verified";
+                                else {
+                                        satisfied = true;
+                                        reason = "local verified identity on a verified-local boot, session fresh and unlocked";
+                                }
                         }
                 }
         }
@@ -710,7 +773,7 @@ static int on_unlock(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
         if (t) {
                 char desc[128];
                 t->locked = false;
-                t->last_verify = now_mono();
+                t->last_verify = now_boottime();
                 snprintf(desc, sizeof desc, "unlock session=%s", t->id);
                 record_runtime_event(userdata, desc);
         }
@@ -747,7 +810,7 @@ static int on_props(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
                 t->locked = true;
         else if (locked == 0) {
                 t->locked = false;
-                t->last_verify = now_mono();
+                t->last_verify = now_boottime();
         }
         return 0;
 }
@@ -763,6 +826,21 @@ static int on_session_removed(sd_bus_message *msg, void *userdata, sd_bus_error 
         const char *id, *path;
         if (sd_bus_message_read(msg, "so", &id, &path) >= 0)
                 untrack_by_path(userdata, path);
+        return 0;
+}
+
+static int on_prepare_for_sleep(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
+        Manager *m = userdata;
+        int sleeping;
+
+        if (sd_bus_message_read(msg, "b", &sleeping) < 0 || !sleeping)
+                return 0;
+
+        for (TrackedSession *s = m->sessions; s; s = s->next)
+                s->last_verify = 0;
+
+        record_runtime_event(m, "sleep freshness=invalidated");
+        sd_journal_print(LOG_INFO, "invalidated session freshness before sleep");
         return 0;
 }
 
@@ -804,6 +882,8 @@ static void setup_logind(Manager *m) {
                         "org.freedesktop.login1.Manager", "SessionNew", on_session_new, m);
         (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
                         "org.freedesktop.login1.Manager", "SessionRemoved", on_session_removed, m);
+        (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                        "org.freedesktop.login1.Manager", "PrepareForSleep", on_prepare_for_sleep, m);
 
         sd_journal_print(LOG_INFO, "tracking logind session lock state and freshness");
 }
@@ -867,14 +947,7 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
 
         e->next = m->events;
         m->events = e;
-        if (++m->n_events > AUTH_EVENTS_MAX) {   /* drop the oldest */
-                AuthEvent **pp = &m->events;
-                while ((*pp)->next)
-                        pp = &(*pp)->next;
-                auth_event_free(*pp);
-                *pp = NULL;
-                m->n_events--;
-        }
+        m->n_events++;
 
         /* a successful authentication is a fresh verification for its session */
         p = sd_json_variant_by_key(parameters, "sessionId");
@@ -882,7 +955,7 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                 TrackedSession *t = find_tracked(m, sd_json_variant_string(p));
                 if (t) {
                         t->locked = false;
-                        t->last_verify = now_mono();
+                        t->last_verify = now_boottime();
                 }
         }
 
@@ -898,6 +971,15 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                 snprintf(desc, sizeof desc, "auth user=%s method=%s result=%s",
                          e->user ?: "", e->method ?: "", e->result ?: "");
                 record_runtime_event(m, desc);
+        }
+
+        if (m->n_events > AUTH_EVENTS_MAX) {   /* drop the oldest */
+                AuthEvent **pp = &m->events;
+                while ((*pp)->next)
+                        pp = &(*pp)->next;
+                auth_event_free(*pp);
+                *pp = NULL;
+                m->n_events--;
         }
 
         if ((r = sd_json_variant_new_object(&empty, NULL, 0)) < 0)
@@ -932,6 +1014,7 @@ static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *arr = NULL, *result = NULL;
         char current[65] = "";
         uint8_t nvval[32];
+        bool complete;
         int r = 0;
 
         for (RuntimeEvent *e = m->runtime_log; e && r >= 0; e = e->next) {
@@ -946,15 +1029,21 @@ static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
                 return r;
         if (!arr && (r = sd_json_variant_new_array(&arr, NULL, 0)) < 0)
                 return r;
+        complete = !m->runtime_log_incomplete;
         if (attest_nv_read(nvval) == 0)
                 for (int i = 0; i < 32; i++)
                         snprintf(current + 2 * i, 3, "%02x", nvval[i]);
+        else
+                complete = false;
         r = sd_json_buildo(&result,
                 SD_JSON_BUILD_PAIR("nvIndex", SD_JSON_BUILD_STRING("0x01800001")),
                 SD_JSON_BUILD_PAIR("baseline", SD_JSON_BUILD_STRING(m->baseline_runtime)),
                 SD_JSON_BUILD_PAIR("current", SD_JSON_BUILD_STRING(current)),
                 SD_JSON_BUILD_PAIR("events", SD_JSON_BUILD_VARIANT(arr)),
-                SD_JSON_BUILD_PAIR("evidenceQuality", SD_JSON_BUILD_STRING(m->n_runtime > 0 ? "measured" : "observed")));
+                SD_JSON_BUILD_PAIR("complete", SD_JSON_BUILD_BOOLEAN(complete)),
+                SD_JSON_BUILD_PAIR("evidenceQuality", SD_JSON_BUILD_STRING(
+                                !complete ? "incomplete" :
+                                m->n_runtime > 0 ? "measured" : "observed")));
         if (r < 0)
                 return r;
         return sd_varlink_reply(link, result);
@@ -1121,6 +1210,8 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
 
         if (!peer_is_root(link))
                 return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
+        if (m->runtime_log_incomplete)
+                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         p = sd_json_variant_by_key(parameters, "nonceHex");
         if (!p || !sd_json_variant_is_string(p) ||
@@ -1137,15 +1228,17 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
             !(sig_hex = hex_encode(sig, sig_len)))
                 return -ENOMEM;
 
-        /* AK-certify the runtime NV log (bound to the same nonce) and read it. */
+        /* AK-certify the runtime NV log with the same primary key and nonce as
+         * the boot quote. Partial runtime evidence is not an attestation. */
         if (attest_nv_certify(nonce, nonce_len, &nv_ak, &nv_ak_len,
-                              &nv_ci, &nv_ci_len, &nv_sig, &nv_sig_len) == 0) {
-                nv_ci_hex = hex_encode(nv_ci, nv_ci_len);
-                nv_sig_hex = hex_encode(nv_sig, nv_sig_len);
-        }
-        if (attest_nv_read(nvval) == 0)
-                for (int i = 0; i < 32; i++)
-                        snprintf(nv_current + 2 * i, 3, "%02x", nvval[i]);
+                              &nv_ci, &nv_ci_len, &nv_sig, &nv_sig_len) < 0 ||
+            nv_ak_len != ak_len || memcmp(nv_ak, ak, ak_len) != 0 ||
+            !(nv_ci_hex = hex_encode(nv_ci, nv_ci_len)) ||
+            !(nv_sig_hex = hex_encode(nv_sig, nv_sig_len)) ||
+            attest_nv_read(nvval) < 0)
+                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+        for (int i = 0; i < 32; i++)
+                snprintf(nv_current + 2 * i, 3, "%02x", nvval[i]);
 
         for (int i = 0; i <= 15; i++) {   /* boot PCRs the quote covers (runtime is in NV) */
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *o = NULL;

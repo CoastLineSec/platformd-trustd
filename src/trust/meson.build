@@ -11,11 +11,12 @@ trustctl = executable(
 # TPM2 attestation: built with tss2-esys when present, a stub otherwise.
 tss2_esys = dependency('tss2-esys', required : false)
 tss2_mu = dependency('tss2-mu', required : false)
+tss2_tctildr = dependency('tss2-tctildr', required : false)
 # libcrypto: in-process Ed25519 verification of homed's signed user records.
 libcrypto = dependency('libcrypto', version : '>= 3.0')
-have_tpm2 = tss2_esys.found() and tss2_mu.found()
+have_tpm2 = tss2_esys.found() and tss2_mu.found() and tss2_tctildr.found()
 attest_src = have_tpm2 ? 'attest.c' : 'attest-stub.c'
-trustd_deps = have_tpm2 ? [libsystemd, tss2_esys, tss2_mu, libcrypto] : [libsystemd, libcrypto]
+trustd_deps = have_tpm2 ? [libsystemd, tss2_esys, tss2_mu, tss2_tctildr, libcrypto] : [libsystemd, libcrypto]
 
 trustd = executable(
         'platformd-trustd',

@@ -27,7 +27,7 @@ It provides three programs:
 - tss2-esys and tss2-mu (the TPM2 Software Stack) — optional; without them attestation is unavailable
 - libpam — optional; builds the authentication-event PAM module
 - meson ≥ 1.1, ninja, and a C11 compiler
-- systemd-ukify (`systemd-measure`), at runtime — used by `trustctl provision` to compute the boot reference
+- systemd-ukify (`systemd-measure`), at runtime — used by `trustctl provision` to compute boot-entry references
 
 ## Build
 
@@ -87,7 +87,7 @@ verifies systemd-homed identities in-process against their Ed25519 signatures,
 folds runtime authentication events into an extend-only TPM NV index, and produces
 an Entity Attestation Token bundling the boot and runtime evidence. It evaluates
 the `verified-boot`, `fresh-user-verification`, and `local-trusted-session`
-policies, grades the boot against a reference provisioned by a `kernel-install`
+policies, grades the boot against references maintained by a `kernel-install`
 plugin, and supports binding the attestation key to the TPM by credential
 activation. Its PAM module both records session establishment and, given a
 `policy=` argument, gates a PAM stack on a policy — letting a screen locker or

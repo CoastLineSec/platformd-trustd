@@ -44,8 +44,9 @@
     commands (<command>attest</command>, <command>attest-token</command>,
     <command>enroll</command>, <command>activate-credential</command>) must run as
     root — the daemon restricts evidence production to root, as it is a signing
-    operation on the shared TPM — and <command>provision</command> requires
-    privilege to write the boot reference.</para>
+    operation on the shared TPM — and <command>provision</command> and
+    <command>remove-boot-reference</command> require privilege to update boot
+    references.</para>
   </refsect1>
 
   <refsect1>
@@ -135,13 +136,21 @@
       </varlistentry>
 
       <varlistentry>
-        <term><command>provision</command> <replaceable>UKI</replaceable></term>
+        <term><command>provision</command> <replaceable>UKI</replaceable> [<replaceable>REFERENCE-ID</replaceable>]</term>
         <listitem><para>Compute the expected boot measurement from the sections of
         the unified kernel image <replaceable>UKI</replaceable>, using
         <citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-        and record it as the boot reference. This is normally run by the
+        and record it for one boot entry. <replaceable>REFERENCE-ID</replaceable>
+        defaults to the UKI filename. This is normally run by the
         <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
         plugin on each kernel installation.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>remove-boot-reference</command> <replaceable>REFERENCE-ID</replaceable></term>
+        <listitem><para>Remove the reference for one boot entry. The
+        <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
+        plugin uses this when removing a kernel.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

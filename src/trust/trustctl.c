@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -235,8 +236,12 @@ static int cmd_runtime_log(void) {
         if (call(link, "io.platformd.Trust.GetRuntimeLog", NULL, &reply) < 0)
                 return EXIT_FAILURE;
 
-        printf("runtime auth log (extend-only NV %s)\n  baseline %s\n  current  %s\n",
-               jstr(reply, "nvIndex"), jstr(reply, "baseline"), jstr(reply, "current"));
+        printf("runtime auth log (extend-only NV %s)\n"
+               "  baseline %s\n"
+               "  current  %s\n"
+               "  complete %s\n",
+               jstr(reply, "nvIndex"), jstr(reply, "baseline"), jstr(reply, "current"),
+               jbool(reply, "complete") ? "yes" : "no");
         arr = sd_json_variant_by_key(reply, "events");
         n = arr ? sd_json_variant_elements(arr) : 0;
         if (n == 0) {
@@ -393,6 +398,36 @@ static const char *state_dir(void) {
         return d;
 }
 
+static bool boot_reference_id_valid(const char *id) {
+        size_t n;
+
+        if (!id || !(n = strlen(id)) || n > 128 || streq(id, ".") || streq(id, ".."))
+                return false;
+
+        for (size_t i = 0; i < n; i++)
+                if (!isalnum((unsigned char) id[i]) && !strchr("._+-", id[i]))
+                        return false;
+
+        return true;
+}
+
+static int boot_reference_path(const char *id, char **ret_dir, char **ret_path) {
+        char *dir = NULL, *path = NULL;
+
+        if (!boot_reference_id_valid(id))
+                return -EINVAL;
+        if (asprintf(&dir, "%s/boot-references", state_dir()) < 0)
+                return -ENOMEM;
+        if (asprintf(&path, "%s/%s.json", dir, id) < 0) {
+                free(dir);
+                return -ENOMEM;
+        }
+
+        *ret_dir = dir;
+        *ret_path = path;
+        return 0;
+}
+
 /* Run argv[] (no shell), capturing stdout into *out (malloc'd). Returns the exit
  * status, or -1 on a spawn failure. */
 static int run_capture(char *const argv[], char **out) {
@@ -446,13 +481,19 @@ static int run_capture(char *const argv[], char **out) {
         return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
 }
 
-/* Parse the '11:sha256=<hex>' lines from systemd-measure output and write the
- * boot reference atomically (0600) to the state directory. */
-static int write_boot_reference(const char *uki, const char *measure_out) {
+/* Parse the '11:sha256=<hex>' lines from systemd-measure output and atomically
+ * replace this boot entry's reference. Other installed entries remain valid. */
+static int write_boot_reference(const char *uki, const char *reference_id, const char *measure_out) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *arr = NULL, *ref = NULL;
-        _cleanup_free_ char *formatted = NULL, *path = NULL, *tmp = NULL;
+        _cleanup_free_ char *formatted = NULL, *dir = NULL, *path = NULL, *tmp = NULL;
         const char *p = measure_out;
-        int fd, nv = 0;
+        size_t off = 0, len;
+        int dirfd = -1, fd = -1, nv = 0, r;
+
+        if (!boot_reference_id_valid(reference_id)) {
+                fprintf(stderr, "trustctl: invalid boot reference identifier '%s'\n", reference_id ?: "");
+                return EXIT_FAILURE;
+        }
 
         while ((p = strstr(p, "11:sha256="))) {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *s = NULL;
@@ -479,31 +520,89 @@ static int write_boot_reference(const char *uki, const char *measure_out) {
         if (sd_json_buildo(&ref,
                         SD_JSON_BUILD_PAIR("pcrBank", SD_JSON_BUILD_STRING("sha256")),
                         SD_JSON_BUILD_PAIR("pcr11", SD_JSON_BUILD_VARIANT(arr)),
-                        SD_JSON_BUILD_PAIR("uki", SD_JSON_BUILD_STRING(uki))) < 0 ||
+                        SD_JSON_BUILD_PAIR("uki", SD_JSON_BUILD_STRING(uki)),
+                        SD_JSON_BUILD_PAIR("referenceId", SD_JSON_BUILD_STRING(reference_id))) < 0 ||
             sd_json_variant_format(ref, SD_JSON_FORMAT_NEWLINE, &formatted) < 0)
                 return EXIT_FAILURE;
 
-        (void) mkdir(state_dir(), 0700);
-        if (asprintf(&path, "%s/boot-reference.json", state_dir()) < 0 ||
-            asprintf(&tmp, "%s/boot-reference.json.tmp", state_dir()) < 0)
+        if ((mkdir(state_dir(), 0700) < 0 && errno != EEXIST) ||
+            boot_reference_path(reference_id, &dir, &path) < 0 ||
+            (mkdir(dir, 0700) < 0 && errno != EEXIST) ||
+            asprintf(&tmp, "%s/.%s.tmp.%ld", dir, reference_id, (long) getpid()) < 0)
                 return EXIT_FAILURE;
-        fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (fd < 0 || write(fd, formatted, strlen(formatted)) != (ssize_t) strlen(formatted)) {
-                if (fd >= 0)
-                        close(fd);
-                fprintf(stderr, "trustctl: cannot write %s: %s\n", tmp, strerror(errno));
+
+        fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+        if (fd < 0) {
+                fprintf(stderr, "trustctl: cannot create %s: %s\n", tmp, strerror(errno));
                 return EXIT_FAILURE;
         }
-        close(fd);
+        len = strlen(formatted);
+        while (off < len) {
+                ssize_t n = write(fd, formatted + off, len - off);
+                if (n < 0) {
+                        r = -errno;
+                        goto fail;
+                }
+                if (n == 0) {
+                        r = -EIO;
+                        goto fail;
+                }
+                off += (size_t) n;
+        }
+        if (fsync(fd) < 0) {
+                r = -errno;
+                goto fail;
+        }
+        if (close(fd) < 0) {
+                fd = -1;
+                r = -errno;
+                goto fail;
+        }
+        fd = -1;
         if (rename(tmp, path) < 0) {
-                fprintf(stderr, "trustctl: cannot install %s: %s\n", path, strerror(errno));
+                r = -errno;
+                goto fail;
+        }
+        if ((dirfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) < 0 ||
+            fsync(dirfd) < 0) {
+                r = -errno;
+                goto fail;
+        }
+        close(dirfd);
+        printf("provisioned boot reference: %d PCR 11 value(s) for %s (%s)\n",
+               nv, uki, reference_id);
+        return EXIT_SUCCESS;
+
+fail:
+        if (fd >= 0)
+                close(fd);
+        if (dirfd >= 0)
+                close(dirfd);
+        (void) unlink(tmp);
+        fprintf(stderr, "trustctl: cannot install %s: %s\n", path, strerror(-r));
+        return EXIT_FAILURE;
+}
+
+static int remove_boot_reference(const char *reference_id) {
+        _cleanup_free_ char *dir = NULL, *path = NULL;
+        int fd;
+
+        if (boot_reference_path(reference_id, &dir, &path) < 0) {
+                fprintf(stderr, "trustctl: invalid boot reference identifier '%s'\n", reference_id ?: "");
                 return EXIT_FAILURE;
         }
-        printf("provisioned boot reference: %d PCR 11 value(s) for %s\n", nv, uki);
+        if (unlink(path) < 0 && errno != ENOENT) {
+                fprintf(stderr, "trustctl: cannot remove %s: %s\n", path, strerror(errno));
+                return EXIT_FAILURE;
+        }
+        if ((fd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC)) >= 0) {
+                (void) fsync(fd);
+                close(fd);
+        }
         return EXIT_SUCCESS;
 }
 
-static int cmd_provision(const char *uki) {
+static int cmd_provision(const char *uki, const char *reference_id) {
         static const char *const secs[] = {
                 "linux", "osrel", "cmdline", "initrd", "uname", "sbat", "splash", "dtb", "ucode",
         };
@@ -558,7 +657,7 @@ static int cmd_provision(const char *uki) {
         if (run_capture(margv, &out) != 0 || !out)
                 fprintf(stderr, "trustctl: systemd-measure failed (is systemd-ukify installed?)\n");
         else
-                rc = write_boot_reference(uki, out);
+                rc = write_boot_reference(uki, reference_id, out);
 
         for (size_t i = 0; i < nsec; i++)
                 unlink(section_file[i]);
@@ -579,7 +678,8 @@ static void usage(void) {
                "  trustctl explain <policy> [id]    Evaluate a named policy (id for session policies)\n"
                "  trustctl events                   Recent authentication events\n"
                "  trustctl runtime-log              Runtime auth measurement log (extend-only NV)\n"
-               "  trustctl provision <uki>          Record the boot reference (kernel-install)\n");
+               "  trustctl provision <uki> [id]     Record one boot-entry reference\n"
+               "  trustctl remove-boot-reference <id>  Remove one boot-entry reference\n");
 }
 
 int main(int argc, char *argv[]) {
@@ -598,7 +698,10 @@ int main(int argc, char *argv[]) {
         if (streq(cmd, "runtime-log"))
                 return cmd_runtime_log();
         if (streq(cmd, "provision") && argc > 2)
-                return cmd_provision(argv[2]);
+                return cmd_provision(argv[2], argc > 3 ? argv[3] :
+                                     strrchr(argv[2], '/') ? strrchr(argv[2], '/') + 1 : argv[2]);
+        if (streq(cmd, "remove-boot-reference") && argc > 2)
+                return remove_boot_reference(argv[2]);
         if (streq(cmd, "pcrs"))
                 return cmd_pcrs();
         if (streq(cmd, "attest"))

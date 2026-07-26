@@ -64,6 +64,7 @@ if command -v varlinkctl >/dev/null 2>&1; then
 
         R=$(vc GetRuntimeLog '{}') || fail "GetRuntimeLog errored: $R"
         echo "$R" | grep -q '"nvIndex"' || fail "GetRuntimeLog has no nvIndex: $R"
+        echo "$R" | grep -q '"complete"' || fail "GetRuntimeLog has no completeness flag: $R"
 
         # Event submission is root-only. Confirm an unprivileged caller is rejected.
         SUBMIT='{"user":"x","uid":1,"pamService":"t","tty":"","remoteHost":"","phase":"open_session","declaredMethod":"password","result":"success","sessionId":"1"}'
@@ -90,5 +91,22 @@ fi
 for cmd in pcrs list-sessions events runtime-log; do
         "$TRUSTCTL" "$cmd" >/dev/null 2>&1 || fail "trustctl $cmd errored"
 done
+
+# Boot references are keyed independently. Removing one must not remove another.
+REFSTATE="$PLATFORMD_TRUSTD_RUNTIME/state"
+mkdir -p "$REFSTATE/boot-references"
+printf '%s\n' '{"pcrBank":"sha256","pcr11":["aa"],"referenceId":"first"}' \
+        > "$REFSTATE/boot-references/first.json"
+printf '%s\n' '{"pcrBank":"sha256","pcr11":["bb"],"referenceId":"second"}' \
+        > "$REFSTATE/boot-references/second.json"
+PLATFORMD_TRUSTD_STATE="$REFSTATE" "$TRUSTCTL" remove-boot-reference first \
+        || fail "remove-boot-reference failed"
+[ ! -e "$REFSTATE/boot-references/first.json" ] \
+        || fail "remove-boot-reference retained the selected reference"
+[ -e "$REFSTATE/boot-references/second.json" ] \
+        || fail "remove-boot-reference removed another reference"
+if PLATFORMD_TRUSTD_STATE="$REFSTATE" "$TRUSTCTL" remove-boot-reference '../invalid' >/dev/null 2>&1; then
+        fail "remove-boot-reference accepted an invalid identifier"
+fi
 
 echo "OK: integration test passed"

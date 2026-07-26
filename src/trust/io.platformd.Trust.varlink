@@ -135,12 +135,14 @@ type RuntimeEvent (
 # NV value and checks it against the AK-signed certification carried in the
 # attestation token, proving the auth history is authentic and bound to this TPM.
 # digest is the running NV value after each event; baseline is the value before
-# trustd's own extensions this boot; current is the live NV value.
+# trustd's own extensions this boot; current is the live NV value. complete is
+# false if an event could not be retained and measured.
 method GetRuntimeLog() -> (
         nvIndex: string,
         baseline: string,
         current: string,
         events: []RuntimeEvent,
+        complete: bool,
         evidenceQuality: string
 )
 

@@ -8,16 +8,21 @@
 #
 # Arguments: COMMAND KERNEL-VERSION ENTRY-DIR KERNEL-IMAGE [INITRD...]
 
-[ "$1" = "add" ] || exit 0
 [ "$KERNEL_INSTALL_LAYOUT" = "uki" ] || exit 0
 command -v trustctl >/dev/null 2>&1 || exit 0
+
+if [ "$1" = "remove" ]; then
+        trustctl remove-boot-reference "$2" >/dev/null 2>&1 || :
+        exit 0
+fi
+[ "$1" = "add" ] || exit 0
 
 UKI="$KERNEL_INSTALL_STAGING_AREA/uki.efi"
 [ -f "$UKI" ] || exit 0
 
 if [ "${KERNEL_INSTALL_VERBOSE:-0}" = "1" ]; then
-        trustctl provision "$UKI" || echo "platformd-trustd: boot reference not updated" >&2
+        trustctl provision "$UKI" "$2" || echo "platformd-trustd: boot reference not updated" >&2
 else
-        trustctl provision "$UKI" >/dev/null 2>&1 || :
+        trustctl provision "$UKI" "$2" >/dev/null 2>&1 || :
 fi
 exit 0

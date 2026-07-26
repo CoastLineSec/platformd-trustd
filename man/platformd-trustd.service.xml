@@ -102,13 +102,13 @@
     <title>Evidence and attestation</title>
 
     <para>The boot is reported <literal>verified-local</literal> when the TPM's
-    PCR&nbsp;11 matches a reference recorded on the system by
+    PCR&nbsp;11 matches one of the references recorded on the system by
     <command>trustctl provision</command>, and <literal>measured</literal>
     otherwise. The reference is computed from the sections of the unified kernel
     image with
     <citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-    the same computation the boot performs, and is refreshed on each kernel
-    installation by a
+    the same computation the boot performs. References are added and removed
+    with their corresponding kernel by a
     <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
     plugin.</para>
 
@@ -145,18 +145,19 @@
       </varlistentry>
 
       <varlistentry>
-        <term><filename>/var/lib/platformd-trustd/boot-reference.json</filename></term>
-        <listitem><para>The expected boot measurement recorded by
+        <term><filename>/var/lib/platformd-trustd/boot-references/*.json</filename></term>
+        <listitem><para>The expected boot measurements recorded by
         <command>trustctl provision</command> and compared against the running
-        PCR&nbsp;11 to grade the boot.</para></listitem>
+        PCR&nbsp;11 to grade the boot. One file is retained for each installed
+        boot entry.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><filename>/usr/lib/kernel/install.d/70-platformd-trustd.install</filename></term>
         <listitem><para>The
         <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        plugin that refreshes the boot reference when a unified kernel image is
-        installed.</para></listitem>
+        plugin that adds or removes the corresponding reference when a unified
+        kernel image is installed or removed.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>

@@ -5,9 +5,48 @@
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <tss2/tss2_esys.h>
 #include <tss2/tss2_mu.h>
+#include <tss2/tss2_tctildr.h>
+
+static int esys_initialize(ESYS_CONTEXT **ret, TSS2_TCTI_CONTEXT **ret_tcti) {
+        ESYS_CONTEXT *context = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
+        const char *tcti_conf;
+
+        tcti_conf = getenv("TSS2_TCTI");
+        if (!tcti_conf || !*tcti_conf) {
+                if (access("/dev/tpmrm0", R_OK | W_OK) == 0)
+                        tcti_conf = "device:/dev/tpmrm0";
+                else if (access("/dev/tpm0", R_OK | W_OK) == 0)
+                        tcti_conf = "device:/dev/tpm0";
+                else
+                        return -EACCES;
+        }
+
+        if (Tss2_TctiLdr_Initialize(tcti_conf, &tcti) != TSS2_RC_SUCCESS) {
+                Tss2_TctiLdr_Finalize(&tcti);
+                return -EACCES;
+        }
+        if (Esys_Initialize(&context, tcti, NULL) != TSS2_RC_SUCCESS) {
+                if (context)
+                        Esys_Finalize(&context);
+                Tss2_TctiLdr_Finalize(&tcti);
+                return -EACCES;
+        }
+
+        *ret = context;
+        *ret_tcti = tcti;
+        return 0;
+}
+
+static void esys_finalize(ESYS_CONTEXT **context, TSS2_TCTI_CONTEXT **tcti) {
+        if (*context)
+                Esys_Finalize(context);
+        Tss2_TctiLdr_Finalize(tcti);
+}
 
 static int dup_bytes(const uint8_t *src, size_t n, uint8_t **out, size_t *out_len) {
         uint8_t *p = malloc(n ?: 1);
@@ -89,6 +128,7 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
                  uint8_t **sig, size_t *sig_len) {
 
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR ak = ESYS_TR_NONE;
         TPM2B_PUBLIC *ak_public = NULL;
         TPM2B_ATTEST *attest = NULL;
@@ -113,7 +153,7 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
                 return -EINVAL;
         memcpy(qualifying.buffer, nonce, nonce_len);
 
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;   /* no TPM device / resource manager reachable */
 
         if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0)
@@ -140,8 +180,7 @@ out:
         Esys_Free(signature);
         if (ak != ESYS_TR_NONE)
                 Esys_FlushContext(ctx, ak);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         if (r < 0) {
                 free(*ak_pub);
                 free(*quoted);
@@ -181,12 +220,13 @@ static int nv_ensure(ESYS_CONTEXT *ctx, ESYS_TR *nv) {
 
 int attest_nv_read(uint8_t value_out[32]) {
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR nv = ESYS_TR_NONE;
         TPM2B_MAX_NV_BUFFER *data = NULL;
         int r = -EIO;
 
         memset(value_out, 0, 32);
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;
         if (nv_ensure(ctx, &nv) < 0)
                 goto out;
@@ -197,13 +237,13 @@ int attest_nv_read(uint8_t value_out[32]) {
         r = 0;
 out:
         Esys_Free(data);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         return r;
 }
 
 int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]) {
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR nv = ESYS_TR_NONE;
         TPM2B_MAX_NV_BUFFER in = { 0 }, *out = NULL;
         int r = -EIO;
@@ -213,7 +253,7 @@ int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]) {
                 return -EINVAL;
         in.size = (uint16_t) len;
         memcpy(in.buffer, data, len);
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;
         if (nv_ensure(ctx, &nv) < 0)
                 goto out;
@@ -225,8 +265,7 @@ int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]) {
         r = 0;
 out:
         Esys_Free(out);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         return r;
 }
 
@@ -236,6 +275,7 @@ int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
                       uint8_t **sig, size_t *sig_len) {
         static const TPMT_SIG_SCHEME scheme = { .scheme = TPM2_ALG_NULL };
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR ak = ESYS_TR_NONE, nv = ESYS_TR_NONE;
         TPM2B_PUBLIC *ak_public = NULL;
         TPM2B_ATTEST *attest = NULL;
@@ -249,7 +289,7 @@ int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
         if (nonce_len == 0 || nonce_len > sizeof qualifying.buffer)
                 return -EINVAL;
         memcpy(qualifying.buffer, nonce, nonce_len);
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;
         if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0 ||
             nv_ensure(ctx, &nv) < 0)
@@ -274,8 +314,7 @@ out:
         Esys_Free(signature);
         if (ak != ESYS_TR_NONE)
                 Esys_FlushContext(ctx, ak);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         if (r < 0) {
                 free(*ak_pub);
                 free(*certify_info);
@@ -290,6 +329,7 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                           uint8_t **ak_pub, size_t *ak_pub_len,
                           uint8_t **ak_name, size_t *ak_name_len) {
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR ek = ESYS_TR_NONE, ak = ESYS_TR_NONE, nv = ESYS_TR_NONE;
         TPM2B_PUBLIC *ekp = NULL, *akp = NULL;
         TPM2B_NAME *akn = NULL;
@@ -300,7 +340,7 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
         *ek_pub = *ek_cert = *ak_pub = *ak_name = NULL;
         *ek_pub_len = *ek_cert_len = *ak_pub_len = *ak_name_len = 0;
 
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;
         if (create_primary(ctx, ESYS_TR_RH_ENDORSEMENT, &ek_template, &ek, &ekp, NULL) < 0 ||
             create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &akp, &akn) < 0)
@@ -340,8 +380,7 @@ out:
                 Esys_FlushContext(ctx, ek);
         if (ak != ESYS_TR_NONE)
                 Esys_FlushContext(ctx, ak);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         if (r < 0) {
                 free(*ek_pub);
                 free(*ak_pub);
@@ -356,6 +395,7 @@ int attest_activate_credential(const uint8_t *cred, size_t cred_len,
                                uint8_t **challenge, size_t *challenge_len) {
         static const TPMT_SYM_DEF sym_null = { .algorithm = TPM2_ALG_NULL };
         ESYS_CONTEXT *ctx = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR ek = ESYS_TR_NONE, ak = ESYS_TR_NONE, policy = ESYS_TR_NONE;
         TPM2B_PUBLIC *ekp = NULL, *akp = NULL;
         TPM2B_ID_OBJECT cred_blob = { 0 };
@@ -372,7 +412,7 @@ int attest_activate_credential(const uint8_t *cred, size_t cred_len,
         if (Tss2_MU_TPM2B_ENCRYPTED_SECRET_Unmarshal(secret, secret_len, &off, &enc_secret) != TSS2_RC_SUCCESS)
                 return -EINVAL;
 
-        if (Esys_Initialize(&ctx, NULL, NULL) != TSS2_RC_SUCCESS)
+        if (esys_initialize(&ctx, &tcti) < 0)
                 return -EACCES;
         if (create_primary(ctx, ESYS_TR_RH_ENDORSEMENT, &ek_template, &ek, &ekp, NULL) < 0 ||
             create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &akp, NULL) < 0)
@@ -408,7 +448,6 @@ out:
                 Esys_FlushContext(ctx, ek);
         if (ak != ESYS_TR_NONE)
                 Esys_FlushContext(ctx, ak);
-        if (ctx)
-                Esys_Finalize(&ctx);
+        esys_finalize(&ctx, &tcti);
         return r;
 }
