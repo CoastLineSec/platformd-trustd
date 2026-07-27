@@ -1,6 +1,27 @@
 platformd-trustd NEWS
 =====================
 
+platformd-trustd 0.1.4
+
+  * The service unit grants read/write access to systemd's char-tpm device
+    group under DevicePolicy=closed, so the default service configuration can
+    use the TPM without exposing unrelated physical devices.
+  * The local-trusted-session policy now denies remote sessions and sessions
+    whose locality cannot be determined. Verification freshness uses
+    CLOCK_BOOTTIME and is invalidated before suspend.
+  * Runtime measurement failures mark the log incomplete. GetRuntimeLog
+    exposes this through a new complete field, and attestation-token production
+    fails unless the runtime NV value is readable and certified by the same
+    attestation key used for the boot quote.
+  * TPM TCTI and ESYS contexts have explicit ownership and are released on all
+    initialization and failure paths.
+  * Boot references are stored per kernel-install entry. trustctl provision
+    accepts a reference identifier, trustctl remove-boot-reference removes one
+    entry, and the kernel-install plugin updates and removes entries
+    independently. The legacy single-reference file remains readable.
+  * UKI reference provisioning and PCR reporting build cleanly with GCC 16
+    release-mode truncation diagnostics enabled.
+
 platformd-trustd 0.1.3
 
   Audit hardening:
