@@ -356,8 +356,11 @@ static int vl_get_measured_boot(sd_varlink *link, sd_json_variant *parameters,
                 if (fgets(hex, sizeof hex, f)) {
                         hex[strcspn(hex, "\n")] = 0;
                         available = true;
-                        if (i == 11)
-                                strncpy(pcr11, hex, sizeof pcr11 - 1);
+                        if (i == 11) {
+                                size_t n = strlen(hex);
+
+                                memcpy(pcr11, hex, n + 1);
+                        }
                         if (r == 0 &&
                             (r = sd_json_buildo(&o,
                                         SD_JSON_BUILD_PAIR("index", SD_JSON_BUILD_INTEGER(i)),

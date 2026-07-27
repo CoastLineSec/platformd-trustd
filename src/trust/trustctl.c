@@ -608,8 +608,8 @@ static int cmd_provision(const char *uki, const char *reference_id) {
         };
         size_t nsec = sizeof secs / sizeof *secs;
         char tmpl[] = "/tmp/trustctl-provision.XXXXXX";
-        char section_file[9][PATH_MAX];
-        char measure_arg[9][PATH_MAX + 24];
+        char section_file[9][PATH_MAX] = {};
+        char *measure_arg[9] = {};
         _cleanup_free_ char *out = NULL;
         char *margv[3 + 9 + 1];
         int mc = 0, rc = EXIT_FAILURE, fd;
@@ -643,24 +643,39 @@ static int cmd_provision(const char *uki, const char *reference_id) {
         margv[mc++] = (char *) "--bank=sha256";
         for (size_t i = 0; i < nsec; i++) {
                 char sect[16];
+                int n;
 
-                snprintf(section_file[i], sizeof section_file[i], "%s/%s", tmp, secs[i]);
+                n = snprintf(section_file[i], sizeof section_file[i], "%s/%s", tmp, secs[i]);
+                if (n < 0 || (size_t) n >= sizeof section_file[i]) {
+                        fprintf(stderr, "trustctl: temporary section path is too long\n");
+                        goto finish;
+                }
                 snprintf(sect, sizeof sect, ".%s", secs[i]);
                 if (pe_extract_section(img, (size_t) st.st_size, sect, section_file[i]) > 0) {
-                        snprintf(measure_arg[i], sizeof measure_arg[i], "--%s=%s", secs[i], section_file[i]);
+                        if (asprintf(&measure_arg[i], "--%s=%s", secs[i], section_file[i]) < 0) {
+                                measure_arg[i] = NULL;
+                                goto finish;
+                        }
                         margv[mc++] = measure_arg[i];
                 }
         }
         margv[mc] = NULL;
         munmap(img, (size_t) st.st_size);
+        img = NULL;
 
         if (run_capture(margv, &out) != 0 || !out)
                 fprintf(stderr, "trustctl: systemd-measure failed (is systemd-ukify installed?)\n");
         else
                 rc = write_boot_reference(uki, reference_id, out);
 
+finish:
+        if (img)
+                munmap(img, (size_t) st.st_size);
         for (size_t i = 0; i < nsec; i++)
-                unlink(section_file[i]);
+                if (section_file[i][0])
+                        unlink(section_file[i]);
+        for (size_t i = 0; i < nsec; i++)
+                free(measure_arg[i]);
         (void) rmdir(tmp);
         return rc;
 }
