@@ -1,6 +1,26 @@
 platformd-trustd NEWS
 =====================
 
+CHANGES WITH 0.1.5:
+
+        * Session lock state and verification freshness are now independent.
+          Session creation and unlock events do not establish freshness.
+          Freshness is recorded only from a qualifying successful
+          platformd-verify event and is invalidated before suspend.
+
+        * SubmitAuthEvent now validates field types and lengths, the declared
+          user name and user ID, the logind session, and session ownership.
+          Ordinary PAM session records remain audit evidence but do not
+          establish verification freshness.
+
+        * Session records now expose the lock state, verification timestamp,
+          source, and evidence quality separately. Authentication event records
+          include their session ID and whether they qualified for freshness.
+
+        * Policy results now include stable machine-readable reason codes.
+          Unknown session class, activity, lock, or verification state fails
+          closed instead of being treated as satisfied.
+
 platformd-trustd 0.1.4
 
   * The service unit grants read/write access to systemd's char-tpm device
