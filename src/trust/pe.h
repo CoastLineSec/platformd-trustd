@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-/* Extract a named section from a PE/UKI image to out_path — in C, no objcopy, so
+/* Extract a named section from a PE/UKI image to out_path without invoking objcopy, so
  * the daemon has no binutils runtime dependency (systemd parses PE itself).
  * Extracts VirtualSize (the actual content), not the zero-padded SizeOfRawData.
  * Returns the section size, 0 if absent, or -1 on a malformed image / write error. */

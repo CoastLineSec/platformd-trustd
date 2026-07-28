@@ -11,7 +11,7 @@
  * stub returns -ENOTSUP when the TPM libraries are absent.
  *
  * The attestation key is a restricted ECC (NIST P-256, ECDSA-SHA256) signing
- * primary in the owner hierarchy — deterministic from the TPM's primary seed, so
+ * primary in the owner hierarchy. It is deterministic from the TPM primary seed, so
  * it is regenerated (not stored) on each call and is stable across reboots.
  */
 
@@ -46,7 +46,7 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                           uint8_t **ak_name, size_t *ak_name_len);
 
 /* Activate a credential a verifier made (TPM2_MakeCredential) for the AK's name
- * and the EK: recovers the challenge only if the AK and EK are on this TPM —
+ * and the EK. It recovers the challenge only if the AK and EK are on this TPM,
  * proving the AK is genuine. cred/secret are the marshaled TPM2B_ID_OBJECT /
  * TPM2B_ENCRYPTED_SECRET. challenge is malloc'd. */
 int attest_activate_credential(const uint8_t *cred, size_t cred_len,

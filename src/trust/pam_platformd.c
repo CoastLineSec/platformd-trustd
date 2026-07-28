@@ -1,29 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/*
- * pam_platformd — the PAM face of platformd-trustd. Two roles, selected by the
- * module arguments:
- *
- *   session, method=<m>   Observability. On session open it submits a structured
- *                         event (user, service, tty, declared method) to the trust
- *                         authority over Varlink and returns success. Place it
- *                         after pam_systemd so XDG_SESSION_ID is set, e.g.:
- *
- *                             session optional pam_platformd.so method=password
- *
- *   auth/account, policy=<p>
- *                         A gate. It asks the trust authority to evaluate a named
- *                         policy for the caller's session and returns PAM_SUCCESS
- *                         if satisfied, PAM_AUTH_ERR otherwise — fail closed, so an
- *                         unreachable authority denies. It authenticates nobody; it
- *                         only reports whether the platform meets the policy, for a
- *                         stack to route on, e.g.:
- *
- *                             auth [success=ignore default=3] pam_platformd.so policy=verified-boot
- *
- * The gate is advisory: it routes on the observed platform state, not a hardware
- * boundary. The declared method is honest by construction — whatever the stack
- * line says, recorded as a declaration, never as a verified fact.
- */
+/* PAM interface for session records and trust policy evaluation. */
 
 #include <pwd.h>
 #include <stdio.h>
@@ -63,11 +39,7 @@ static const char *item(pam_handle_t *pamh, int type) {
         return pam_get_item(pamh, type, &v) == PAM_SUCCESS && v ? (const char *) v : "";
 }
 
-/* Exchange one Varlink message with trustd over a raw AF_UNIX socket, returning
- * the parsed reply (caller owns it) or NULL. We deliberately do not use
- * sd_varlink_call here: it drives its own event loop, which corrupts the heap when
- * run from inside a PAM module loaded into an arbitrary process. The request is
- * built from a variant, so field values are escaped. */
+/* sd_varlink_call() cannot be used from every process that loads a PAM module. */
 static sd_json_variant *trustd_call(const char *method, sd_json_variant *params) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *envelope = NULL;
         _cleanup_free_ char *text = NULL, *buf = NULL;
@@ -79,8 +51,7 @@ static sd_json_variant *trustd_call(const char *method, sd_json_variant *params)
         size_t buflen = 0, cap = 0, tlen;
         int fd, len;
 
-        /* Accept either an explicit socket path or a runtime directory (the two
-         * conventions used across the components), else the default location. */
+        /* Accept an explicit socket path or runtime directory. */
         if (sock && *sock)
                 len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s", sock);
         else
@@ -141,9 +112,12 @@ static void submit(pam_handle_t *pamh, const char *phase, const char *method, co
         const char *sid = pam_getenv(pamh, "XDG_SESSION_ID");
         struct passwd *pw = getpwnam(user);
 
+        if (!pw || !sid || !*sid)
+                return;
+
         if (sd_json_buildo(&params,
                 SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(user)),
-                SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(pw ? pw->pw_uid : (uid_t) -1)),
+                SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(pw->pw_uid)),
                 SD_JSON_BUILD_PAIR("pamService", SD_JSON_BUILD_STRING(item(pamh, PAM_SERVICE))),
                 SD_JSON_BUILD_PAIR("tty", SD_JSON_BUILD_STRING(item(pamh, PAM_TTY))),
                 SD_JSON_BUILD_PAIR("remoteHost", SD_JSON_BUILD_STRING(item(pamh, PAM_RHOST))),
@@ -155,10 +129,7 @@ static void submit(pam_handle_t *pamh, const char *phase, const char *method, co
         reply = trustd_call("io.platformd.Trust.SubmitAuthEvent", params);
 }
 
-/* Ask the trust authority whether a named policy is satisfied for the caller's
- * session. PAM_SUCCESS if satisfied; PAM_AUTH_ERR if denied or — fail closed — if
- * the authority cannot be reached or does not answer, so an unverifiable platform
- * never routes into the stronger factors. Authenticates nobody. */
+/* An unavailable authority denies the policy. */
 static int gate(pam_handle_t *pamh, const char *policy) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *reply = NULL;
         const char *sid = pam_getenv(pamh, "XDG_SESSION_ID");
@@ -170,9 +141,9 @@ static int gate(pam_handle_t *pamh, const char *policy) {
                 return PAM_AUTH_ERR;
         reply = trustd_call("io.platformd.Trust.EvaluatePolicy", params);
         if (!reply || sd_json_variant_by_key(reply, "error"))
-                return PAM_AUTH_ERR;   /* fail closed: unreachable or errored */
+                return PAM_AUTH_ERR;
 
-        /* raw reply keeps the wire wrapper: { parameters: { result: { result: … } } } */
+        /* Raw replies retain the Varlink wire envelope. */
         outer = sd_json_variant_by_key(reply, "parameters");
         inner = outer ? sd_json_variant_by_key(outer, "result") : NULL;
         res = inner ? sd_json_variant_by_key(inner, "result") : NULL;
@@ -202,7 +173,6 @@ int pam_sm_acct_mgmt(pam_handle_t *pamh, int flags, int argc, const char **argv)
         const char *policy = arg_policy(argc, argv);
         if (!policy)
                 return PAM_IGNORE;
-        /* PAM_PERM_DENIED is the account-phase idiom for "this account may not
-         * proceed"; PAM_AUTH_ERR is for the auth phase. */
+        /* The account phase reports policy denial with PAM_PERM_DENIED. */
         return gate(pamh, policy) == PAM_SUCCESS ? PAM_SUCCESS : PAM_PERM_DENIED;
 }

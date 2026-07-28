@@ -193,8 +193,8 @@ out:
 #define TRUSTD_NV_INDEX 0x01800001u
 
 /* Ensure trustd's extend-only NV index exists (define it if absent). It is a
- * PCR-like extend index that clears on reboot (STCLEAR) but — unlike an
- * application PCR — cannot be reset at locality 0, so the runtime auth log is
+ * PCR-like extend index that clears on reboot (STCLEAR). Unlike an
+ * application PCR, it cannot be reset at locality 0, so the runtime auth log is
  * append-only within a boot. */
 static int nv_ensure(ESYS_CONTEXT *ctx, ESYS_TR *nv) {
         static const TPM2B_AUTH empty = { .size = 0 };
@@ -230,7 +230,7 @@ int attest_nv_read(uint8_t value_out[32]) {
                 return -EACCES;
         if (nv_ensure(ctx, &nv) < 0)
                 goto out;
-        /* Before the first extend the index is unwritten — treat as all-zero. */
+        /* Before the first extend the index is unwritten and reads as all zeroes. */
         if (Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
                          32, 0, &data) == TSS2_RC_SUCCESS && data->size == 32)
                 memcpy(value_out, data->buffer, 32);
@@ -355,7 +355,7 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                 goto out;
         }
 
-        /* The EK certificate from NV (ECC EK cert index), best-effort — many
+        /* The EK certificate from NV is optional because many
          * firmware TPMs ship without one; the activation proof works regardless. */
         if (Esys_TR_FromTPMPublic(ctx, 0x01C0000A, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nv) == TSS2_RC_SUCCESS) {
                 TPM2B_NV_PUBLIC *nvpub = NULL;
@@ -429,7 +429,7 @@ int attest_activate_credential(const uint8_t *cred, size_t cred_len,
                 goto out;
 
         /* Only a TPM holding both the AK (this name) and the EK can recover the
-         * challenge — proof the AK lives on this genuine TPM. */
+         * challenge. This proves the AK lives on the same TPM. */
         if (Esys_ActivateCredential(ctx, ak, ek, ESYS_TR_PASSWORD, policy, ESYS_TR_NONE,
                                     &cred_blob, &enc_secret, &cert_info) != TSS2_RC_SUCCESS)
                 goto out;

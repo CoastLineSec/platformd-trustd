@@ -1,6 +1,4 @@
-# Man pages, authored in DocBook XML and rendered with xsltproc against the
-# DocBook manpages stylesheet — the same toolchain systemd uses. Requires
-# docbook-xsl (the stylesheet) and xsltproc; skipped if xsltproc is absent.
+# DocBook manual pages require docbook-xsl and xsltproc.
 
 xsltproc = find_program('xsltproc', required : false)
 
@@ -18,6 +16,7 @@ if xsltproc.found()
                 '--stringparam', 'man.output.quietly', '1',
                 '--stringparam', 'man.authors.section.enabled', '0',
                 '--stringparam', 'man.copyright.section.enabled', '0',
+                '--stringparam', 'refentry.meta.get.quietly', '1',
         ]
         manpages_stylesheet = 'http://docbook.sourceforge.net/release/xsl/current/manpages/docbook.xsl'
 

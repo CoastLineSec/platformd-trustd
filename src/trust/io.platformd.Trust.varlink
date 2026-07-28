@@ -1,12 +1,10 @@
 # platformd-trustd platform-authentication state interface.
 #
-# Read-only observability (milestone T1). No secret material ever crosses it.
 # Served on a system Varlink socket at $RUNTIME_DIRECTORY/io.platformd.Trust
-# (/run/platformd-trustd/io.platformd.Trust). Browse it with varlinkctl.
+# (/run/platformd-trustd/io.platformd.Trust).
 interface io.platformd.Trust
 
-# Local boot identity and OS release. T1 records observed values only; Secure
-# Boot and TPM/PCR evidence arrive in a later milestone.
+# Local boot identity, operating system release, and observed platform state.
 method GetBootEvidence() -> (
         bootId: string,
         machineId: string,
@@ -25,9 +23,7 @@ type Pcr (
         sha256: string
 )
 
-# The measured boot: the TPM's SHA-256 PCR bank and event-log availability.
-# Hardware-anchored (measured), unlike the observed summary in GetBootEvidence.
-# The event log is forwarded to a verifier at attestation time.
+# The TPM SHA-256 PCR bank and event log availability.
 method GetMeasuredBoot() -> (
         available: bool,
         pcrBank: string,
@@ -48,7 +44,11 @@ type Session (
         active: bool,
         remote: bool,
         locked: bool,
+        lockState: string,
         secondsSinceVerification: int,
+        verificationRealtimeUSec: int,
+        verificationSource: string,
+        verificationQuality: string,
         tty: string,
         leader: int,
         userVerified: bool,
@@ -56,16 +56,15 @@ type Session (
         evidenceQuality: string
 )
 
-# Every logind session, as a trust record. locked and secondsSinceVerification
-# (-1 when never recorded) come from observing logind lock/unlock over time.
+# Every logind session, as a trust record. lockState comes from logind.
+# Verification fields come only from qualifying SubmitAuthEvent calls.
 method ListSessions() -> (sessions: []Session)
 
 # One session's trust record.
 method GetSessionTrust(sessionId: string) -> (session: Session)
 
-# Verified identity for a uid: whether systemd-homed vouches for it with an
-# Ed25519-signed user record (verified), the public signing key, and the source.
-# Only public data is exposed — never the record's privileged section.
+# Public identity data for a user ID. A signed systemd-homed record is reported
+# as verified after its Ed25519 signature is checked.
 method GetUserIdentity(uid: int) -> (
         userName: string,
         uid: int,
@@ -79,17 +78,13 @@ type PolicyResult (
         policyId: string,
         sessionId: string,
         result: string,
+        reasonCode: string,
         reason: string,
         windowSec: int
 )
 
-# Evaluate a named local policy. Policies:
-#  - verified-boot: the boot matches the provisioned reference (verified-local).
-#    A platform property, evaluated without a session.
-#  - fresh-user-verification: session active, unlocked, and verified within windowSec.
-#  - local-trusted-session: fresh-user-verification AND a verified (homed Ed25519)
-#    identity AND a verified-local boot — the full local trust verdict.
-# result is "policy-satisfied" or "denied", always with a specific reason.
+# Evaluate a named local policy. reasonCode is stable and machine-readable.
+# result is "policy-satisfied" or "denied".
 method EvaluatePolicy(policy: string, sessionId: string) -> (result: PolicyResult)
 
 type AuthEvent (
@@ -101,13 +96,16 @@ type AuthEvent (
         phase: string,
         declaredMethod: string,
         result: string,
+        sessionId: string,
+        qualifiesForFreshness: bool,
         realtimeUSec: int,
         evidenceQuality: string
 )
 
-# Submit a PAM authentication event (pam_platformd.so). Restricted to root — the
-# PAM module runs privileged — so ordinary users cannot forge events on the
-# world-readable socket. A successful event refreshes its session's freshness.
+# Submit an authentication event. The caller must be root, and the named session
+# must exist and belong to uid. Events are retained as declared audit evidence.
+# Only a successful platformd-verifyd event from the platformd-verify PAM service
+# qualifies as session freshness.
 method SubmitAuthEvent(
         user: string,
         uid: int,
@@ -120,7 +118,7 @@ method SubmitAuthEvent(
         sessionId: string
 ) -> ()
 
-# Recent authentication events, newest first (in-memory, capped).
+# Recent authentication events, newest first. The list is bounded and in-memory.
 method ListAuthEvents() -> (events: []AuthEvent)
 
 type RuntimeEvent (
@@ -129,14 +127,10 @@ type RuntimeEvent (
         realtimeUSec: int
 )
 
-# The runtime measurement log: auth and lock/unlock events, each folded by the TPM
-# into trustd's extend-only NV index (append-only within a boot; not resettable at
-# locality 0 like an application PCR). A verifier replays baseline + events → the
-# NV value and checks it against the AK-signed certification carried in the
-# attestation token, proving the auth history is authentic and bound to this TPM.
-# digest is the running NV value after each event; baseline is the value before
-# trustd's own extensions this boot; current is the live NV value. complete is
-# false if an event could not be retained and measured.
+# Authentication and lock state events are extended into a TPM NV index.
+# baseline is the value before this service extends the index during the current
+# boot. current is the live value. complete is false after a measurement or
+# retention failure.
 method GetRuntimeLog() -> (
         nvIndex: string,
         baseline: string,
@@ -146,12 +140,9 @@ method GetRuntimeLog() -> (
         evidenceQuality: string
 )
 
-# Produce a TPM2 quote over the boot PCRs (SHA-256, 0..15; the runtime auth log
-# is certified separately from its NV index), bound to nonceHex. Verifiable
-# against akPublicHex without trusting trustd: check the signature over quotedHex,
-# that it carries the nonce, and that the attested PCR digest matches the values
-# from GetMeasuredBoot (or an eventLogHex replay). All fields are hex.
-# Restricted to root: producing evidence is a signing operation on the shared TPM.
+# Produce a TPM2 quote over SHA-256 PCRs 0 through 15, bound to nonceHex.
+# Runtime events are certified separately from their NV index. All fields are
+# hexadecimal. Restricted to user ID 0.
 method Attest(nonceHex: string) -> (
         akPublicHex: string,
         quotedHex: string,
@@ -161,24 +152,18 @@ method Attest(nonceHex: string) -> (
         evidenceQuality: string
 )
 
-# Produce a self-contained IETF RATS Entity Attestation Token (RFC 9711, JSON
-# profile) bundling the full evidence: standard claims (eat_profile, eat_nonce,
-# ueid, iat, dbgstat), a cnf holding the AK public key, and a measurements array —
-# the AK-signed TPM quote (the anchor), the boot PCRs + quality, and the runtime
-# auth log. `eat` is the serialized token a RATS Verifier consumes directly:
-# verify the quote against cnf, confirm the nonce, replay the PCRs/runtime log
-# against the quoted digest. format is the media type. Restricted to root.
+# Produce an IETF Entity Attestation Token using the RFC 9711 JSON profile.
+# The token contains the TPM quote, boot measurements, and runtime log.
+# Restricted to user ID 0.
 method GetAttestationToken(nonceHex: string) -> (
         eat: string,
         format: string,
         evidenceQuality: string
 )
 
-# AK enrollment evidence: the Endorsement Key public + its manufacturer cert (if
-# present in NV; empty otherwise), and the Attestation Key public + TPM name. A
-# verifier checks the EK cert (genuine TPM), then runs TPM2_MakeCredential over
-# ekPublicHex + akNameHex and challenges the daemon via ActivateCredential.
-# Restricted to root.
+# Return the Endorsement Key public data and optional manufacturer certificate,
+# together with the Attestation Key public data and TPM name.
+# Restricted to user ID 0.
 method GetEnrollment() -> (
         ekPublicHex: string,
         ekCertHex: string,
@@ -187,9 +172,8 @@ method GetEnrollment() -> (
         evidenceQuality: string
 )
 
-# Activate a verifier's credential (marshaled TPM2B_ID_OBJECT + TPM2B_ENCRYPTED_
-# SECRET, hex): the TPM recovers the challenge only if the AK and EK are on this
-# same TPM — proving the AK is genuine, not a software key. Restricted to root.
+# Activate a credential containing a marshaled TPM2B_ID_OBJECT and
+# TPM2B_ENCRYPTED_SECRET. Restricted to user ID 0.
 method ActivateCredential(credentialHex: string, secretHex: string) -> (
         challengeHex: string,
         evidenceQuality: string
@@ -198,5 +182,6 @@ method ActivateCredential(credentialHex: string, secretHex: string) -> (
 error NoSuchSession()
 error UnknownPolicy()
 error PermissionDenied()
+error InvalidAuthEvent()
 error AttestationUnsupported()
 error AttestationFailed()

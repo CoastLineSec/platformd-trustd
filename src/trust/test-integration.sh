@@ -1,6 +1,6 @@
 #!/bin/sh
 # Integration test: exercise the io.platformd.Trust Varlink surface and its error
-# paths. Designed to pass with no root, no TPM, no logind session, and no homed —
+# paths. Designed to pass with no root, no TPM, no logind session, and no homed.
 # the daemon degrades gracefully (observed evidence, empty session list,
 # attestation unsupported) while the error paths (unknown policy, non-root event
 # submission) still behave correctly. Anything the daemon can only do with a TPM
@@ -36,10 +36,12 @@ if command -v varlinkctl >/dev/null 2>&1; then
         R=$(vc ListSessions '{}') || fail "ListSessions errored: $R"
         echo "$R" | grep -q '"sessions"' || fail "ListSessions has no sessions array: $R"
 
-        # A verdict on an unknown session is 'denied' — never crashes, never satisfied.
+        # An unknown session is always denied.
         R=$(vc EvaluatePolicy '{"policy":"local-trusted-session","sessionId":"no-such-xyz"}') \
                 || fail "EvaluatePolicy(unknown session) errored: $R"
         echo "$R" | grep -q 'denied' || fail "unknown session was not denied: $R"
+        echo "$R" | grep -q '"reasonCode":"session-not-found"' \
+                || fail "unknown session has no stable reason code: $R"
 
         # An unknown policy is a clean Varlink error, not a crash.
         if vc EvaluatePolicy '{"policy":"totally-bogus","sessionId":"x"}' >/dev/null 2>&1; then
@@ -67,7 +69,7 @@ if command -v varlinkctl >/dev/null 2>&1; then
         echo "$R" | grep -q '"complete"' || fail "GetRuntimeLog has no completeness flag: $R"
 
         # Event submission is root-only. Confirm an unprivileged caller is rejected.
-        SUBMIT='{"user":"x","uid":1,"pamService":"t","tty":"","remoteHost":"","phase":"open_session","declaredMethod":"password","result":"success","sessionId":"1"}'
+        SUBMIT='{"user":"x","uid":1,"pamService":"t","tty":"","remoteHost":"","phase":"session","declaredMethod":"password","result":"success","sessionId":"1"}'
         if [ "$(id -u)" = "0" ]; then
                 if command -v setpriv >/dev/null 2>&1; then
                         if setpriv --reuid=65534 --regid=65534 --clear-groups \

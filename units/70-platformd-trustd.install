@@ -1,11 +1,5 @@
 #!/bin/sh
 # SPDX-License-Identifier: LGPL-2.1-or-later
-#
-# kernel-install plugin: when a unified kernel image is installed, record its
-# expected boot measurement with platformd-trustd, so trustd can grade the
-# running boot "verified-local". Best-effort — it never fails a kernel or UKI
-# installation.
-#
 # Arguments: COMMAND KERNEL-VERSION ENTRY-DIR KERNEL-IMAGE [INITRD...]
 
 [ "$KERNEL_INSTALL_LAYOUT" = "uki" ] || exit 0

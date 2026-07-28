@@ -1,12 +1,5 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
-/*
- * trustctl — inspect and provision platformd-trustd's platform-authentication state.
- *
- * Mostly a read-only Varlink client of io.platformd.Trust (status, list-sessions,
- * session, explain, events, pcrs, attest). The `provision` verb is the exception:
- * run at UKI-install time by the kernel-install plugin, it records the expected
- * boot measurement so trustd can grade the running boot verified-local.
- */
+/* Inspect and provision platformd-trustd state. */
 
 #include <ctype.h>
 #include <errno.h>
@@ -75,10 +68,11 @@ static sd_varlink *connect_trustd(void) {
 }
 
 static int call(sd_varlink *link, const char *method, sd_json_variant *params, sd_json_variant **ret) {
+        sd_json_variant *reply = NULL;
         const char *err = NULL;
         int r;
 
-        r = sd_varlink_call(link, method, params, ret, &err);
+        r = sd_varlink_call(link, method, params, &reply, &err);
         if (r < 0) {
                 fprintf(stderr, "trustctl: call failed: %s\n", strerror(-r));
                 return r;
@@ -87,6 +81,8 @@ static int call(sd_varlink *link, const char *method, sd_json_variant *params, s
                 fprintf(stderr, "trustctl: %s\n", err);
                 return -EIO;
         }
+        if (ret)
+                *ret = sd_json_variant_ref(reply);
         return 0;
 }
 
@@ -97,11 +93,14 @@ static void print_session(const char *id, sd_json_variant *s) {
         printf("  seat:      %-8s type=%s class=%s\n", jstr(s, "seat"), jstr(s, "type"), jstr(s, "class"));
         printf("  state:     %-8s active=%s remote=%s\n", jstr(s, "state"),
                jbool(s, "active") ? "yes" : "no", jbool(s, "remote") ? "yes" : "no");
-        printf("  locked:    %s\n", jbool(s, "locked") ? "yes" : "no");
+        printf("  lock:      %s\n", jstr(s, "lockState"));
         if (jint(s, "secondsSinceVerification") < 0)
                 printf("  verified:  no record\n");
         else
-                printf("  verified:  %llds ago\n", (long long) jint(s, "secondsSinceVerification"));
+                printf("  verified:  %llds ago (%s, %s)\n",
+                       (long long) jint(s, "secondsSinceVerification"),
+                       jstr(s, "verificationSource"),
+                       jstr(s, "verificationQuality"));
         if (*jstr(s, "tty"))
                 printf("  tty:       %s\n", jstr(s, "tty"));
         printf("  leader:    %" PRIu64 "\n", juint(s, "leader"));
@@ -133,7 +132,7 @@ static int cmd_status(void) {
                 printf("\n");
                 print_session(mysession, sd_json_variant_by_key(sess, "session"));
         } else
-                printf("\nSession:     none — this process is not in a logind session\n");
+                printf("\nSession:     none; this process is not in a logind session\n");
         return EXIT_SUCCESS;
 }
 
@@ -190,9 +189,10 @@ static int cmd_explain(const char *policy, const char *session) {
         printf("policy:    %s\n", jstr(r, "policyId"));
         printf("session:   %s\n", jstr(r, "sessionId"));
         printf("result:    %s\n", jstr(r, "result"));
+        printf("code:      %s\n", jstr(r, "reasonCode"));
         printf("reason:    %s\n", jstr(r, "reason"));
         printf("window:    %" PRIu64 "s\n", juint(r, "windowSec"));
-        /* exit 0 only when the policy is satisfied, so scripts can branch on it */
+        /* A satisfied policy is the only successful result. */
         return streq(jstr(r, "result"), "policy-satisfied") ? EXIT_SUCCESS : EXIT_FAILURE;
 }
 
@@ -206,7 +206,8 @@ static int cmd_events(void) {
         if (call(link, "io.platformd.Trust.ListAuthEvents", NULL, &reply) < 0)
                 return EXIT_FAILURE;
 
-        printf("%-20s %-12s %-14s %-9s %s\n", "WHEN", "USER", "SERVICE", "RESULT", "METHOD");
+        printf("%-20s %-10s %-10s %-14s %-9s %-5s %s\n",
+               "WHEN", "SESSION", "USER", "SERVICE", "RESULT", "FRESH", "METHOD");
         arr = sd_json_variant_by_key(reply, "events");
         for (size_t i = 0, n = arr ? sd_json_variant_elements(arr) : 0; i < n; i++) {
                 sd_json_variant *e = sd_json_variant_by_index(arr, i);
@@ -219,8 +220,14 @@ static int cmd_events(void) {
                         if (localtime_r(&t, &tm))
                                 strftime(when, sizeof when, "%Y-%m-%d %H:%M:%S", &tm);
                 }
-                printf("%-20s %-12s %-14s %-9s %s\n", when, jstr(e, "user"),
-                       jstr(e, "pamService"), jstr(e, "result"), jstr(e, "declaredMethod"));
+                printf("%-20s %-10s %-10s %-14s %-9s %-5s %s\n",
+                       when,
+                       jstr(e, "sessionId"),
+                       jstr(e, "user"),
+                       jstr(e, "pamService"),
+                       jstr(e, "result"),
+                       jbool(e, "qualifiesForFreshness") ? "yes" : "no",
+                       jstr(e, "declaredMethod"));
         }
         return EXIT_SUCCESS;
 }
@@ -259,7 +266,7 @@ static int cmd_runtime_log(void) {
                         if (localtime_r(&t, &tm))
                                 strftime(when, sizeof when, "%H:%M:%S", &tm);
                 }
-                printf("  %s  %-40s %.16s…\n", when, jstr(e, "description"), jstr(e, "digest"));
+                printf("  %s  %-40s %.16s...\n", when, jstr(e, "description"), jstr(e, "digest"));
         }
         return EXIT_SUCCESS;
 }
@@ -365,7 +372,7 @@ static int cmd_enroll(void) {
                 return EXIT_FAILURE;
         printf("ek-public: %s\n", jstr(reply, "ekPublicHex"));
         cert = jstr(reply, "ekCertHex");
-        printf("ek-cert  : %s\n", *cert ? cert : "(none in NV — firmware TPM)");
+        printf("ek-cert  : %s\n", *cert ? cert : "(none in NV; firmware TPM)");
         printf("ak-public: %s\n", jstr(reply, "akPublicHex"));
         printf("ak-name  : %s\n", jstr(reply, "akNameHex"));
         return EXIT_SUCCESS;
@@ -637,7 +644,7 @@ static int cmd_provision(const char *uki, const char *reference_id) {
         }
 
         /* Extract each UKI PE section, then drive systemd-measure over the ones
-         * present — the same computation systemd-stub does, reproducing PCR 11. */
+         * present. This is the computation systemd-stub uses for PCR 11. */
         margv[mc++] = (char *) "/usr/lib/systemd/systemd-measure";
         margv[mc++] = (char *) "calculate";
         margv[mc++] = (char *) "--bank=sha256";
@@ -681,7 +688,7 @@ finish:
 }
 
 static void usage(void) {
-        printf("trustctl — inspect platform-authentication state\n\n"
+        printf("trustctl - inspect platform-authentication state\n\n"
                "  trustctl status                   Boot evidence and this session\n"
                "  trustctl pcrs                     TPM PCR bank (measured boot)\n"
                "  trustctl attest [nonceHex]        Produce a TPM quote (attestation)\n"

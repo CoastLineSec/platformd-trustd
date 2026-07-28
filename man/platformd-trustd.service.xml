@@ -3,11 +3,12 @@
   "http://www.oasis-open.org/docbook/xml/4.5/docbookx.dtd">
 <!-- SPDX-License-Identifier: LGPL-2.1-or-later -->
 
-<refentry id="platformd-trustd.service" xmlns:xi="http://www.w3.org/2001/XInclude">
+<refentry id="platformd-trustd.service">
 
   <refentryinfo>
     <title>platformd-trustd.service</title>
     <productname>platformd</productname>
+    <corpauthor>platformd contributors</corpauthor>
   </refentryinfo>
 
   <refmeta>
@@ -20,7 +21,7 @@
   <refnamediv>
     <refname>platformd-trustd.service</refname>
     <refname>platformd-trustd</refname>
-    <refpurpose>Platform-authentication state and attestation service</refpurpose>
+    <refpurpose>Collect and evaluate platform authentication state</refpurpose>
   </refnamediv>
 
   <refsynopsisdiv>
@@ -31,108 +32,109 @@
   <refsect1>
     <title>Description</title>
 
-    <para><filename>platformd-trustd.service</filename> is a system service that
-    observes the platform's authentication state and produces hardware-rooted
-    attestation over it. It reports the boot state, the identity backing each
-    login session, the lock and verification state of those sessions, and the
-    authentication events that established them, and it signs this state with the
-    system TPM so that a separate party may appraise it. Its state is inspected
-    and its attestation is produced with
-    <citerefentry><refentrytitle>trustctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
+    <para><filename>platformd-trustd.service</filename> collects boot, login
+    session, user identity, and authentication evidence. It evaluates named
+    local policies and can produce TPM attestation over the collected
+    state.</para>
 
-    <para>The service does not itself grant access to anything. It is an
-    <ulink url="https://www.rfc-editor.org/rfc/rfc9334.html">RATS</ulink> Attester
-    and a local Verifier: it collects Evidence and appraises it against reference
-    values, but the decision to act on the result belongs to the Relying Party
-    that consumes it. Accordingly the service never reports that the platform is
-    <literal>trusted</literal>; it qualifies every claim as
-    <literal>observed</literal>, <literal>declared</literal>,
-    <literal>measured</literal>, <literal>verified</literal> or
-    <literal>policy-satisfied</literal>, as described in
-    <xref linkend='evidence'/> below.</para>
+    <para>The service does not authenticate users, process credentials, release
+    secrets, or grant access. A caller that consumes a policy result remains
+    responsible for enforcement.</para>
 
-    <para>The boot state is read from the firmware and the TPM: the firmware type
-    and Secure Boot state from the EFI variables under
-    <filename>/sys/firmware/efi</filename>, and the measured PCRs from
-    <filename>/sys/class/tpm/tpm0</filename>. Session and lock state are read from
+    <para>Boot information is obtained from EFI variables, the TPM PCR bank, and
+    the TCG event log. Session state is obtained from
     <citerefentry><refentrytitle>systemd-logind.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>.
-    User identity is resolved through the User/Group Record Lookup API of
-    <citerefentry><refentrytitle>systemd-userdbd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>;
-    a record signed by
-    <citerefentry><refentrytitle>systemd-homed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    is verified in-process by checking its Ed25519 signature against the public
-    key carried in the record. Authentication events are submitted by the PAM
-    module <filename>pam_platformd.so</filename>; see
-    <citerefentry><refentrytitle>pam_platformd</refentrytitle><manvolnum>8</manvolnum></citerefentry>.</para>
+    User records are resolved through the User/Group Record Lookup API.
+    Authentication events are submitted over Varlink by privileged local
+    components.</para>
 
-    <para>The daemon announces readiness through
-    <citerefentry><refentrytitle>sd_notify</refentrytitle><manvolnum>3</manvolnum></citerefentry>
-    and terminates cleanly on <constant>SIGTERM</constant>. It runs as a system
-    service and requires no configuration.</para>
+    <para>The daemon sends a readiness notification and terminates on
+    <constant>SIGTERM</constant> or <constant>SIGINT</constant>.</para>
   </refsect1>
 
   <refsect1>
-    <title>The Varlink interface</title>
+    <title>Session state</title>
 
-    <para>The service exposes a single
-    <citerefentry><refentrytitle>varlink</refentrytitle><manvolnum>7</manvolnum></citerefentry>
-    interface, <constant>io.platformd.Trust</constant>, on a
-    <constant>AF_UNIX</constant> socket at
-    <filename>/run/platformd-trustd/io.platformd.Trust</filename>. No secret
-    material crosses it. The interface may be browsed and called directly with
-    <citerefentry><refentrytitle>varlinkctl</refentrytitle><manvolnum>1</manvolnum></citerefentry>.</para>
+    <para>Session lock state is read from the logind
+    <varname>LockedHint</varname> property. It is reported as
+    <literal>locked</literal>, <literal>unlocked</literal>, or
+    <literal>unknown</literal>. Lock state changes do not establish or clear
+    verification freshness.</para>
 
-    <para>It provides methods to read the boot evidence
-    (<function>GetBootEvidence</function>, <function>GetMeasuredBoot</function>),
-    the session records (<function>ListSessions</function>,
-    <function>GetSessionTrust</function>), the verified identity for a user
-    (<function>GetUserIdentity</function>), and the recorded authentication events
-    (<function>ListAuthEvents</function>); to evaluate a named policy for a session
-    (<function>EvaluatePolicy</function>); and to produce attestation — a TPM quote
-    (<function>Attest</function>), the runtime authentication measurement log
-    (<function>GetRuntimeLog</function>), a complete attestation token
-    (<function>GetAttestationToken</function>), and the evidence to bind the
-    attestation key to the TPM (<function>GetEnrollment</function>,
-    <function>ActivateCredential</function>).
-    <function>SubmitAuthEvent</function> records an authentication event and is
-    restricted to callers with user ID 0.</para>
+    <para>New sessions have no verification timestamp. Session creation and
+    unlock notifications do not establish freshness. Freshness is established
+    only by an accepted event with <varname>pamService</varname> set to
+    <literal>platformd-verify</literal>, <varname>phase</varname> set to
+    <literal>verify</literal>, <varname>declaredMethod</varname> set to
+    <literal>platformd-verify</literal>, and <varname>result</varname> set to
+    <literal>success</literal>. The event must name an existing eligible logind
+    session owned by the declared user ID.</para>
+
+    <para>Freshness uses <constant>CLOCK_BOOTTIME</constant>, has a default
+    window of 300 seconds, and is cleared before suspend. The window may be set
+    with <varname>$PLATFORMD_TRUST_FRESH_WINDOW_SEC</varname>.</para>
   </refsect1>
 
-  <refsect1 id='evidence'>
+  <refsect1>
+    <title>Varlink interface</title>
+
+    <para>The service listens on
+    <filename>/run/platformd-trustd/io.platformd.Trust</filename> and implements
+    <constant>io.platformd.Trust</constant>. The interface contains methods for
+    reading boot, session, identity, authentication event, and runtime
+    measurement records. It also contains methods for evaluating policies and
+    producing attestation.</para>
+
+    <para><function>SubmitAuthEvent</function> requires a caller with user ID 0.
+    It validates field lengths and values, the declared user name and user ID,
+    the named session, and session ownership. Records from
+    <filename>pam_platformd.so</filename> use the
+    <literal>session</literal> phase and are audit records only. They do not
+    establish freshness.</para>
+
+    <para>The attestation methods also require user ID 0. Reading collected
+    state and evaluating a policy do not require privilege. No secret or PAM
+    response is carried by the interface.</para>
+  </refsect1>
+
+  <refsect1>
+    <title>Policies</title>
+
+    <para><literal>verified-boot</literal> succeeds when PCR 11 matches a
+    provisioned local reference. <literal>fresh-user-verification</literal>
+    requires an active and unlocked eligible session with a qualifying
+    verification inside the freshness window.
+    <literal>local-trusted-session</literal> additionally requires a local
+    session, a verified user record, and a
+    <literal>verified-local</literal> boot.</para>
+
+    <para>Each result includes a stable machine-readable reason code and a
+    descriptive reason. The result is <literal>policy-satisfied</literal> or
+    <literal>denied</literal>.</para>
+  </refsect1>
+
+  <refsect1>
     <title>Evidence and attestation</title>
 
-    <para>The boot is reported <literal>verified-local</literal> when the TPM's
-    PCR&nbsp;11 matches one of the references recorded on the system by
-    <command>trustctl provision</command>, and <literal>measured</literal>
-    otherwise. The reference is computed from the sections of the unified kernel
-    image with
-    <citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>,
-    the same computation the boot performs. References are added and removed
-    with their corresponding kernel by a
+    <para>The boot is reported as <literal>verified-local</literal> when PCR 11
+    matches a reference generated from an installed unified kernel image by
+    <citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry>.
+    The references are maintained by a
     <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-    plugin.</para>
+    plugin. They are local reference values and do not establish an external
+    trust root.</para>
 
-    <para>A user identity is reported <literal>verified</literal> only when its
-    record carries a valid Ed25519 signature. The session's active, unlocked and
-    recently-verified state, and the authentication method that established it, are
-    <literal>declared</literal>: they cannot be cryptographically proven on their
-    own, and are trustworthy only to the extent that the boot they are declared on
-    is itself attested — the components that report them are measured into that
-    boot.</para>
+    <para>When TPM support is available, <function>Attest</function> returns a
+    nonce-bound quote over the boot PCRs. Runtime events are extended into a TPM
+    NV index. <function>GetAttestationToken</function> combines the quote, boot
+    measurements, and runtime log in the JSON Entity Attestation Token profile.
+    <function>GetEnrollment</function> and
+    <function>ActivateCredential</function> support binding the attestation key
+    to the TPM.</para>
 
-    <para>Attestation is signed by a restricted ECC attestation key derived from
-    the TPM's primary seed. <function>Attest</function> returns a TPM quote over
-    the boot PCRs, bound to a caller nonce and verifiable against the key's public
-    part without trusting the service. Runtime authentication events are folded
-    into an extend-only TPM NV index, whose value is certified by the same key;
-    the log needed to replay it is returned by <function>GetRuntimeLog</function>.
-    <function>GetAttestationToken</function> bundles the quote, the boot
-    measurements and the runtime log into an
-    <ulink url="https://www.rfc-editor.org/rfc/rfc9711.html">Entity Attestation
-    Token</ulink>. A remote party may bind the attestation key to a genuine TPM
-    from the Endorsement Key certificate and a credential-activation exchange
-    driven through <function>GetEnrollment</function> and
-    <function>ActivateCredential</function>.</para>
+    <para>Authentication events are declared evidence. TPM measurement protects
+    the recorded sequence from undetected modification after collection, but
+    does not verify a declared authentication method.</para>
   </refsect1>
 
   <refsect1>
@@ -141,23 +143,19 @@
     <variablelist>
       <varlistentry>
         <term><filename>/run/platformd-trustd/io.platformd.Trust</filename></term>
-        <listitem><para>The Varlink socket the service listens on.</para></listitem>
+        <listitem><para>The Varlink socket.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><filename>/var/lib/platformd-trustd/boot-references/*.json</filename></term>
-        <listitem><para>The expected boot measurements recorded by
-        <command>trustctl provision</command> and compared against the running
-        PCR&nbsp;11 to grade the boot. One file is retained for each installed
-        boot entry.</para></listitem>
+        <listitem><para>Local boot measurement references.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><filename>/usr/lib/kernel/install.d/70-platformd-trustd.install</filename></term>
-        <listitem><para>The
+        <listitem><para>The boot reference
         <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        plugin that adds or removes the corresponding reference when a unified
-        kernel image is installed or removed.</para></listitem>
+        plugin.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -167,11 +165,9 @@
 
     <para><simplelist type="inline">
       <member><citerefentry><refentrytitle>trustctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
+      <member><citerefentry><refentrytitle>pam_platformd</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>systemd-logind.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
-      <member><citerefentry><refentrytitle>systemd-homed.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
-      <member><citerefentry><refentrytitle>systemd-userdbd.service</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry project='man-pages'><refentrytitle>systemd-measure</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
-      <member><citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry></member>
       <member><citerefentry><refentrytitle>varlinkctl</refentrytitle><manvolnum>1</manvolnum></citerefentry></member>
     </simplelist></para>
   </refsect1>

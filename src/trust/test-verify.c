@@ -2,7 +2,7 @@
 /* Unit test for user_record_verify with a synthetic homed-style signed record: a
  * minimal {userName,disposition,uid} record signed with a throwaway Ed25519 key,
  * embedded below. A valid signature is accepted; a tampered signed field or a
- * missing signature is rejected — guarding the Ed25519 normalization against a
+ * missing signature is rejected. This guards the Ed25519 normalization against a
  * silent regression (e.g. an sd-json canonicalization change). */
 
 #include "verify.h"

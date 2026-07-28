@@ -8,6 +8,7 @@
   <refentryinfo>
     <title>trustctl</title>
     <productname>platformd</productname>
+    <corpauthor>platformd contributors</corpauthor>
   </refentryinfo>
 
   <refmeta>
@@ -43,8 +44,8 @@
     interface; the reading commands require no privilege, while the attestation
     commands (<command>attest</command>, <command>attest-token</command>,
     <command>enroll</command>, <command>activate-credential</command>) must run as
-    root — the daemon restricts evidence production to root, as it is a signing
-    operation on the shared TPM — and <command>provision</command> and
+    root. The daemon restricts evidence production because it is a signing
+    operation on the shared TPM. <command>provision</command> and
     <command>remove-boot-reference</command> require privilege to update boot
     references.</para>
   </refsect1>
@@ -77,18 +78,20 @@
       <varlistentry>
         <term><command>explain</command> <replaceable>POLICY</replaceable> <replaceable>ID</replaceable></term>
         <listitem><para>Evaluate <replaceable>POLICY</replaceable> for the session
-        <replaceable>ID</replaceable> and print the result together with the reason
-        for it. The policies are <constant>fresh-user-verification</constant> (the
-        session is active, unlocked and was verified within the freshness window)
-        and <constant>local-trusted-session</constant> (in addition, the identity
-        is verified and the boot is <literal>verified-local</literal>). The result
-        is <literal>policy-satisfied</literal> or <literal>denied</literal>.</para></listitem>
+        <replaceable>ID</replaceable> and print the result, stable reason code,
+        descriptive reason, and freshness window. The policies are
+        <constant>verified-boot</constant>,
+        <constant>fresh-user-verification</constant>, and
+        <constant>local-trusted-session</constant>. The result is
+        <literal>policy-satisfied</literal> or
+        <literal>denied</literal>.</para></listitem>
       </varlistentry>
 
       <varlistentry>
         <term><command>events</command></term>
         <listitem><para>Show the recorded authentication events, most recent
-        first.</para></listitem>
+        first, and whether each event established verification
+        freshness.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -100,7 +103,7 @@
       <varlistentry>
         <term><command>runtime-log</command></term>
         <listitem><para>Show the runtime authentication measurement log: the
-        authentication and lock events folded into the extend-only TPM NV index,
+        authentication and lock state events folded into the extend-only TPM NV index,
         with the baseline and current values needed to replay it.</para></listitem>
       </varlistentry>
 

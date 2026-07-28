@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* Unit test for pe_extract_section: a crafted minimal PE confirms it extracts the
- * VirtualSize content (not the zero-padded SizeOfRawData — the regression that
+ * VirtualSize content rather than the zero-padded SizeOfRawData. This guards
  * once produced wrong measurements), handles an absent section, and rejects a
  * malformed image. */
 

@@ -38,7 +38,7 @@ long pe_extract_section(const uint8_t *img, size_t len, const char *sect, const 
                 vsize = le32(img + sh + 8);         /* VirtualSize: the actual content */
                 rsize = le32(img + sh + 16);        /* SizeOfRawData: zero-padded on disk */
                 ptr = le32(img + sh + 20);          /* PointerToRawData */
-                /* Measure the content, not the alignment padding — as objcopy and
+                /* Measure the content rather than the alignment padding, as objcopy and
                  * systemd-stub do. */
                 size = (vsize > 0 && vsize < rsize) ? vsize : rsize;
                 if ((size_t) ptr + size > len)

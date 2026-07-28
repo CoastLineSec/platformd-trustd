@@ -30,7 +30,7 @@ platformd-trustd 0.1.3
     GetEnrollment, ActivateCredential) are now restricted to root. Producing a
     TPM quote or certification is a signing operation on a shared, slow device;
     reading recorded state stays open to every local peer.
-  * The TCG event log is read to EOF rather than truncated at 64 KiB — a
+  * The TCG event log is read to EOF rather than truncated at 64 KiB. A
     truncated log cannot be replayed, so a short read now returns no log instead
     of incomplete evidence.
   * A session that already existed when the daemon started is recorded with its
@@ -63,14 +63,10 @@ platformd-trustd 0.1.0
     systemd-homed identities (Ed25519); an extend-only NV runtime auth log; a TPM
     quote and an IETF Entity Attestation Token (RFC 9711) bundling boot and
     runtime evidence; attestation-key enrollment by EK credential activation; and
-    the fresh-user-verification and local-trusted-session policies. Consumed by
-    platformd-secretd.
+    the fresh-user-verification and local-trusted-session policies.
 
 platformd-trustd 0.0.1
 
   * Observability core: boot identity and logind sessions as read-only records
     over the Varlink interface io.platformd.Trust; trustctl status /
     list-sessions / session.
-
-  Versioning: the 0.x series is pre-release. The 1.0 tag is gated on an
-  independent security review.

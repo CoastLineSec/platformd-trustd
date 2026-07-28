@@ -39,7 +39,7 @@ bool user_record_verify(sd_json_variant *record) {
                 return false;   /* not an Ed25519 signature */
 
         /* The signed form: the record without the non-signable sections, key-sorted
-         * (normalize) and compact — the same normalization homed signs. */
+         * (normalize) and compact. This is the normalization homed signs. */
         signable = sd_json_variant_ref(record);
         if (sd_json_variant_filter(&signable, exclude) < 0 ||
             sd_json_variant_normalize(&signable) < 0 ||
