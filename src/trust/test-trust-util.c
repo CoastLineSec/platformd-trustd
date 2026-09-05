@@ -6,6 +6,14 @@
 #include <errno.h>
 #include <string.h>
 
+static void test_policy_implication(TrustPolicyInput input) {
+        TrustPolicyDecision fresh, trusted;
+
+        assert(trust_evaluate_policy("fresh-user-verification", &input, &fresh) == 0);
+        assert(trust_evaluate_policy("local-trusted-session", &input, &trusted) == 0);
+        assert(!trusted.satisfied || fresh.satisfied);
+}
+
 static void expect(
                 const char *policy,
                 TrustPolicyInput input,
@@ -18,9 +26,12 @@ static void expect(
         assert(decision.satisfied == satisfied);
         assert(strcmp(decision.reason_code, reason_code) == 0);
         assert(decision.reason && *decision.reason);
+        test_policy_implication(input);
 }
 
 int main(void) {
+        static const uint64_t windows[] = { 0, 1, 300, INT64_MAX, UINT64_MAX };
+        static const int64_t ages[] = { -1, 0, 1, 2, 299, 300, 301, INT64_MAX };
         TrustSessionState state = { .lock_state = -1 };
         TrustPolicyInput input = {
                 .session_exists = true,
@@ -96,6 +107,19 @@ int main(void) {
         expect("local-trusted-session", input, false, "boot-not-verified");
         input.boot_verified = true;
         expect("local-trusted-session", input, true, "local-trusted-session");
+
+        for (size_t i = 0; i < sizeof windows / sizeof windows[0]; i++)
+                for (size_t j = 0; j < sizeof ages / sizeof ages[0]; j++) {
+                        bool satisfied = ages[j] >= 0 && (uint64_t) ages[j] <= windows[i];
+                        const char *reason = ages[j] < 0 ? "verification-missing" : "verification-stale";
+
+                        input.freshness_window_sec = windows[i];
+                        input.seconds_since_verification = ages[j];
+                        expect("fresh-user-verification", input, satisfied,
+                               satisfied ? "verification-fresh" : reason);
+                        expect("local-trusted-session", input, satisfied,
+                               satisfied ? "local-trusted-session" : reason);
+                }
 
         assert(trust_evaluate_policy("unknown", &input, &decision) == -EOPNOTSUPP);
         assert(trust_text_valid("valid", 16));

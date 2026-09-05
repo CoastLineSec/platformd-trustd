@@ -1,18 +1,29 @@
 #!/bin/sh
-# T1 smoke test: the daemon starts, serves io.platformd.Trust, and trustctl
-# reads boot evidence and the session list. Runs without root or a live logind
-# session (0 sessions is a valid result).
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -e
+
+if [ "${1:-}" != "--test-inner" ]; then
+        exec sh "$(dirname "$0")/test-env.sh" sh "$0" --test-inner "$@"
+fi
+shift
 
 TRUSTD="$1"
 TRUSTCTL="$2"
 PLATFORMD_TRUSTD_RUNTIME="$(mktemp -d)"
-export PLATFORMD_TRUSTD_RUNTIME
 SOCK="$PLATFORMD_TRUSTD_RUNTIME/io.platformd.Trust"
+PLATFORMD_TRUST_SOCKET="$SOCK"
+export PLATFORMD_TRUSTD_RUNTIME PLATFORMD_TRUST_SOCKET
 
 "$TRUSTD" >/dev/null 2>&1 &
 PID=$!
-trap 'kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$PLATFORMD_TRUSTD_RUNTIME"' EXIT
+cleanup() {
+        kill -TERM "$PID" 2>/dev/null || :
+        wait "$PID" 2>/dev/null || :
+        rm -rf -- "$PLATFORMD_TRUSTD_RUNTIME"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 i=0
 while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do

@@ -49,6 +49,10 @@ test('integration', find_program('sh'),
      args : [meson.current_source_dir() / 'test-integration.sh', trustd, trustctl],
      timeout : 60)
 
+test('environment', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-environment.sh', trustd, trustctl],
+     timeout : 60)
+
 test('pe', executable('test-pe', 'test-pe.c', 'pe.c'))
 test('verify', executable('test-verify', 'test-verify.c', 'verify.c',
      dependencies : [libsystemd, libcrypto]))

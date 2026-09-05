@@ -1,21 +1,29 @@
 #!/bin/sh
-# Integration test: exercise the io.platformd.Trust Varlink surface and its error
-# paths. Designed to pass with no root, no TPM, no logind session, and no homed.
-# the daemon degrades gracefully (observed evidence, empty session list,
-# attestation unsupported) while the error paths (unknown policy, non-root event
-# submission) still behave correctly. Anything the daemon can only do with a TPM
-# or a live session is validated by hand under run0; here we validate the surface.
+# SPDX-License-Identifier: LGPL-2.1-or-later
 set -u
+
+if [ "${1:-}" != "--test-inner" ]; then
+        exec sh "$(dirname "$0")/test-env.sh" sh "$0" --test-inner "$@"
+fi
+shift
 
 TRUSTD="$1"
 TRUSTCTL="$2"
 PLATFORMD_TRUSTD_RUNTIME="$(mktemp -d)"
-export PLATFORMD_TRUSTD_RUNTIME
 SOCK="$PLATFORMD_TRUSTD_RUNTIME/io.platformd.Trust"
+PLATFORMD_TRUST_SOCKET="$SOCK"
+export PLATFORMD_TRUSTD_RUNTIME PLATFORMD_TRUST_SOCKET
 
 "$TRUSTD" >/dev/null 2>&1 &
 PID=$!
-trap 'kill -TERM $PID 2>/dev/null; wait $PID 2>/dev/null; rm -rf "$PLATFORMD_TRUSTD_RUNTIME"' EXIT
+cleanup() {
+        kill -TERM "$PID" 2>/dev/null || :
+        wait "$PID" 2>/dev/null || :
+        rm -rf -- "$PLATFORMD_TRUSTD_RUNTIME"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 i=0
 while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
@@ -53,12 +61,11 @@ if command -v varlinkctl >/dev/null 2>&1; then
         R=$(vc GetUserIdentity '{"uid":0}') || fail "GetUserIdentity errored: $R"
         echo "$R" | grep -q '"userName"' || fail "GetUserIdentity has no userName: $R"
 
-        # Producing evidence is root-only. A non-root caller must be refused; for
-        # root it quotes, or errors cleanly without a TPM.
+        # The test environment has no TPM backend, including for a root caller.
         R=$(vc Attest '{"nonceHex":"deadbeef"}' || true)
         if [ "$(id -u)" = "0" ]; then
-                echo "$R" | grep -qE 'quotedHex|AttestationUnsupported|AttestationFailed' \
-                        || fail "Attest (root) neither quoted nor errored cleanly: $R"
+                echo "$R" | grep -qE 'AttestationUnsupported|AttestationFailed' \
+                        || fail "Attest (root) did not reject the unavailable TPM: $R"
         else
                 echo "$R" | grep -q 'PermissionDenied' \
                         || fail "Attest from a non-root caller was not refused: $R"
