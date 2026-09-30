@@ -2,21 +2,29 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 # Arguments: COMMAND KERNEL-VERSION ENTRY-DIR KERNEL-IMAGE [INITRD...]
 
-[ "$KERNEL_INSTALL_LAYOUT" = "uki" ] || exit 0
-command -v trustctl >/dev/null 2>&1 || exit 0
+set -eu
 
-if [ "$1" = "remove" ]; then
-        trustctl remove-boot-reference "$2" >/dev/null 2>&1 || :
-        exit 0
+case "$1" in
+    remove)
+        exec trustctl remove-boot-reference "$2"
+        ;;
+    add)
+        [ "${KERNEL_INSTALL_LAYOUT:-}" = uki ] || exit 0
+        ;;
+    *) exit 0 ;;
+esac
+
+uki="${KERNEL_INSTALL_STAGING_AREA:-}/uki.efi"
+if [ ! -f "$uki" ]; then
+    uki="${4:-}"
 fi
-[ "$1" = "add" ] || exit 0
-
-UKI="$KERNEL_INSTALL_STAGING_AREA/uki.efi"
-[ -f "$UKI" ] || exit 0
-
-if [ "${KERNEL_INSTALL_VERBOSE:-0}" = "1" ]; then
-        trustctl provision "$UKI" "$2" || echo "platformd-trustd: boot reference not updated" >&2
-else
-        trustctl provision "$UKI" "$2" >/dev/null 2>&1 || :
+if [ -z "$uki" ] || [ ! -f "$uki" ]; then
+    echo "platformd-trustd: no UKI is available for boot reference provisioning" >&2
+    trustctl remove-boot-reference "$2"
+    exit 1
 fi
-exit 0
+
+if ! trustctl provision "$uki" "$2"; then
+    trustctl remove-boot-reference "$2"
+    exit 1
+fi

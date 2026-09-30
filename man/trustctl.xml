@@ -117,9 +117,10 @@
 
       <varlistentry>
         <term><command>attest-token</command> <optional><replaceable>NONCE</replaceable></optional></term>
-        <listitem><para>Produce a complete attestation token in the Entity
-        Attestation Token format, bundling the quote, the boot measurements and the
-        runtime log.</para></listitem>
+        <listitem><para>Produce a platformd-specific JSON evidence envelope
+        containing the TPM quote, boot measurements, and runtime log. Only the
+        embedded TPM structures are signed; local assertions are unsigned.
+        The envelope is not an IETF Entity Attestation Token.</para></listitem>
       </varlistentry>
 
       <varlistentry>

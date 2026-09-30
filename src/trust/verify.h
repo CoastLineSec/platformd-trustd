@@ -11,3 +11,4 @@
  * and check the embedded Ed25519 signature against the embedded public key.
  * Makes trustd a true verifier of the identity, not a relay of userdb's claim. */
 bool user_record_verify(sd_json_variant *record);
+const char *user_record_signing_key(sd_json_variant *record);

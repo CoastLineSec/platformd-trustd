@@ -19,7 +19,7 @@
  * malloc'd (caller frees): the marshaled AK public (TPM2B_PUBLIC), the raw
  * attestation data (TPMS_ATTEST), and the marshaled signature (TPMT_SIGNATURE).
  * Returns 0, or a negative errno-style code (-ENOTSUP without TPM2 support,
- * -EACCES when the TPM is unreachable, -EIO on a TPM error). */
+ * -ENODEV when no TPM transport is available, -EIO on a TPM error). */
 int attest_quote(const uint8_t *nonce, size_t nonce_len,
                  uint8_t **ak_pub, size_t *ak_pub_len,
                  uint8_t **quoted, size_t *quoted_len,
@@ -31,6 +31,8 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
  * AK-signed certification of the value bound to a nonce. value_out is 32 bytes;
  * the certify outputs are malloc'd. Return 0 or a negative errno-style code. */
 int attest_nv_read(uint8_t value_out[32]);
+int attest_nv_initialize(void);
+int attest_nv_public(uint8_t **ret, size_t *ret_size);
 int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]);
 int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
                       uint8_t **ak_pub, size_t *ak_pub_len,

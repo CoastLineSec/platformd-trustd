@@ -51,9 +51,27 @@
     for the same logind session.</para>
 
     <para>When used as an <option>auth</option> or <option>account</option>
-    module with <option>policy=</option>, it evaluates the named policy for the
-    caller's logind session. An unreachable service, an interface error, and a
-    denied policy all fail closed.</para>
+    module with <option>policy=</option>, it evaluates the named policy. An
+    unreachable service, a malformed or mismatched reply, and a denied policy
+    all fail closed.</para>
+
+    <para>The <literal>verified-boot</literal> policy does not require a user
+    or session. The <literal>fresh-user-verification</literal> and
+    <literal>local-trusted-session</literal> policies require the calling
+    process to belong to a logind session owned by the user named in
+    <constant>PAM_USER</constant>. The module does not use
+    <varname>XDG_SESSION_ID</varname> to select a session. Session policies
+    fail before a session has been created, in processes outside a session,
+    and when the PAM account differs from the session owner. Session records
+    use the same ownership check and are omitted when it cannot be
+    satisfied.</para>
+
+    <para>The module connects only to
+    <filename>/run/platformd-trustd/io.platformd.Trust</filename> and requires
+    a socket peer with user ID 0. Environment variables do not override this
+    endpoint. Each exchange has a five-second deadline and requires a
+    complete, NUL-terminated Varlink message of at most 64 KiB, including the
+    terminator.</para>
   </refsect1>
 
   <refsect1>
@@ -69,7 +87,11 @@
       <varlistentry>
         <term><option>policy=</option><replaceable>POLICY</replaceable></term>
         <listitem><para>Evaluate <replaceable>POLICY</replaceable> for the
-        caller's logind session.</para></listitem>
+        current boot or session. Supported values are
+        <literal>verified-boot</literal>,
+        <literal>fresh-user-verification</literal>, and
+        <literal>local-trusted-session</literal>. Unknown policies are
+        denied.</para></listitem>
       </varlistentry>
     </variablelist>
   </refsect1>
@@ -82,8 +104,10 @@
     <constant>PAM_SUCCESS</constant> for a satisfied policy and
     <constant>PAM_AUTH_ERR</constant> otherwise. The <option>account</option>
     module returns <constant>PAM_SUCCESS</constant> for a satisfied policy and
-    <constant>PAM_PERM_DENIED</constant> otherwise. A module invocation without
-    a supported argument returns <constant>PAM_IGNORE</constant>.</para>
+    <constant>PAM_PERM_DENIED</constant> otherwise. The <option>auth</option>
+    and <option>account</option> modules return <constant>PAM_IGNORE</constant>
+    when <option>policy=</option> is absent. Credential establishment returns
+    <constant>PAM_IGNORE</constant>.</para>
   </refsect1>
 
   <refsect1>

@@ -128,9 +128,9 @@ type RuntimeEvent (
 )
 
 # Authentication and lock state events are extended into a TPM NV index.
-# baseline is the value before this service extends the index during the current
-# boot. current is the live value. complete is false after a measurement or
-# retention failure.
+# baseline precedes the retained window of at most 1024 events. current is the
+# live value. complete requires a matching replay and no measurement failure
+# during this service instance. Earlier history is not recovered on restart.
 method GetRuntimeLog() -> (
         nvIndex: string,
         baseline: string,
@@ -152,9 +152,9 @@ method Attest(nonceHex: string) -> (
         evidenceQuality: string
 )
 
-# Produce an IETF Entity Attestation Token using the RFC 9711 JSON profile.
-# The token contains the TPM quote, boot measurements, and runtime log.
-# Restricted to user ID 0.
+# Produce a platformd-specific attestation envelope with embedded TPM evidence.
+# The legacy field name eat is retained; the format is not RFC 9711 EAT.
+# The outer JSON and local assertions are unsigned. Restricted to user ID 0.
 method GetAttestationToken(nonceHex: string) -> (
         eat: string,
         format: string,

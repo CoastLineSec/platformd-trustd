@@ -46,8 +46,14 @@ from installed unified kernel images by `systemd-measure`. They are local
 reference values and do not establish an external trust root.
 
 User information is resolved through the User/Group Record Lookup API. A
-systemd-homed record is reported as `verified` only after its Ed25519 signature
-has been checked. Other user records are reported as `declared`.
+systemd-homed record is reported as `verified` only after an Ed25519 signature
+has been checked and the record's UID and name match the requested identity.
+Any applicable signature may satisfy this check. The root-owned homed endpoint
+is the identity authority; a key embedded in an arbitrary record is not an
+independent trust root. Other user records are reported as `declared`.
+
+Identity lookups run in bounded workers with a two-second overall deadline.
+Policy results are evaluated against current session state after lookup completes.
 
 Authentication events are declared evidence. Restricting submission to user ID
 0 and measuring events into a TPM NV index protects the local collection and
@@ -67,8 +73,10 @@ classes are eligible for verification freshness:
 Lock state and verification freshness have separate sources and update rules.
 
 The `lockState` field is read from the logind `LockedHint` property. Its value is
-`locked`, `unlocked`, or `unknown`. A lock state update does not change
-verification freshness.
+`locked`, `unlocked`, or `unknown`. Locking or losing authoritative lock state
+invalidates verification freshness. Unlocking never establishes freshness.
+Subscriptions precede enumeration. A logind owner change discards cached session
+state; a system-bus disconnect terminates the service for automatic restart.
 
 A new session has no verification timestamp. Creating or unlocking a session
 does not establish freshness. A successful authentication event establishes
@@ -82,12 +90,12 @@ freshness only when all of these fields match:
 | `result` | `success` |
 
 The event must name an existing eligible session owned by the declared user ID.
-The declared user name must resolve to the same user ID. Verification events do
+The declared user name must match logind's name for that session. Verification events do
 not change lock state.
 
 Freshness is measured with `CLOCK_BOOTTIME`. It is cleared before suspend.
 The default freshness window is 300 seconds. It may be changed with
-`$PLATFORMD_TRUST_FRESH_WINDOW_SEC` in the service environment.
+`$PLATFORMD_TRUST_FRESH_WINDOW_SEC` in the service environment, from 1 to 86400.
 
 The session record exposes the monotonic age and the realtime timestamp of the
 last qualifying event. `verificationSource` is `platformd-verifyd` and
@@ -106,6 +114,9 @@ verification freshness.
 
 Accepted events are kept in a bounded in-memory list and are submitted to the
 runtime measurement log. The event list is lost when the daemon exits.
+Acknowledgement records the event and freshness state; it does not wait for TPM
+measurement. TPM work is serialized in a bounded queue with a twenty-second
+overall deadline. A failed or dropped measurement marks the runtime log incomplete.
 
 ## Policies
 
@@ -143,13 +154,51 @@ stable machine-readable value. The currently returned reason codes are:
 
 Unknown policy names return `io.platformd.Trust.UnknownPolicy`.
 
+## PAM policy enforcement
+
+`pam_platformd.so` accepts policy replies only from the fixed system-service
+endpoint with peer user ID 0. A successful reply must contain the requested
+policy and session identifiers, a complete typed result, and the corresponding
+positive reason code.
+
+For session policies, `PAM_USER` must resolve to the owner of the calling
+process's logind session. Environment-supplied session identifiers are not
+used. A missing session or a different target account denies the gate. The
+`verified-boot` gate evaluates the boot without selecting a user session.
+These rules also prevent session records from naming another account's session.
+
 ## Attestation
 
 When TPM2-TSS and a usable TPM are available, `Attest` returns a nonce-bound
 TPM quote over the boot PCRs. Runtime events are extended into an NV index and
 certified with the same attestation key. `GetAttestationToken` combines the
-quote, measurements, and runtime log in the JSON Entity Attestation Token
-profile.
+quote, measurements, and runtime log in an unsigned, platformd-specific JSON
+envelope. Its media type is `application/vnd.platformd.attestation+json` and
+its profile is `io.platformd.Trust.Attestation.v1`. The legacy Varlink output
+field `eat` contains this envelope for interface compatibility. This is not an
+RFC 9711 Entity Attestation Token.
+
+TPM signatures protect only the embedded quote and NV certification structures.
+`localAssertions`, including machine ID, time, and Secure Boot observation, are
+unsigned. Secure Boot state is not evidence about debug facilities. A verifier
+must compare the signed nonce, quoted PCR digest, NV name and value against the
+returned data. `nvPublicHex` contains the marshaled `TPM2B_NV_PUBLIC` needed to
+validate the index name and attributes.
+
+The runtime log uses NV index `0x01800001`, with SHA-256, the extend type, a
+32-byte value, and the fixed attributes checked by the implementation. Reads
+never create an index. The administrative command
+`platformd-trustd --initialize-runtime-log` creates a missing index and rejects
+a conflicting definition. It does not replace or delete an existing index.
+Restart the service after initializing the index.
+
+The retained log is a window of at most 1024 events from the current service
+instance. Evicting an event advances `baseline` to its resulting digest. Replay
+starts at that baseline and computes `SHA256(previous || description)` over
+each description's UTF-8 bytes, without a terminating NUL. A restart establishes
+a new baseline and does not recover earlier event descriptions. Completeness
+applies to this retained window, not the entire boot. It requires a matching
+live NV value and no measurement failure during the service instance.
 
 `GetEnrollment` returns the Endorsement Key and Attestation Key public data.
 `ActivateCredential` completes a TPM credential activation exchange. A remote
@@ -158,7 +207,8 @@ Attestation Key with credential activation, verify the quote, check the nonce,
 and appraise the supplied measurements.
 
 Attestation methods return `io.platformd.Trust.AttestationUnsupported` when
-TPM support was not built or no usable TPM is available. An incomplete runtime
+TPM support was not built or no TPM device is available. TPM command, authorization,
+or malformed-evidence failures return `AttestationFailed`. An incomplete runtime
 measurement log is not emitted as complete attestation evidence.
 
 ## Limitations

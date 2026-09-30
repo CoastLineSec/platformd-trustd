@@ -21,11 +21,14 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/socket.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
+#include <openssl/evp.h>
+#include "varlink-interface.h"
 
 #include <systemd/sd-bus.h>
 #include <systemd/sd-daemon.h>
@@ -39,6 +42,7 @@
 #include "attest.h"
 #include "trust-util.h"
 #include "verify.h"
+#include "worker.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -49,6 +53,7 @@ typedef struct TrackedSession {
         struct TrackedSession *next;
         char *id;
         char *path;
+        sd_bus_slot *lock_query;
         TrustSessionState state;
 } TrackedSession;
 
@@ -78,9 +83,21 @@ typedef struct Manager {
         bool runtime_log_incomplete;
         char baseline_runtime[65];  /* NV log value before trustd's extensions this boot */
         uint64_t fresh_window;    /* seconds; the fresh-user-verification window */
+        struct IdentityRequest *identity_requests;
+        sd_json_variant *identities;
+        sd_bus_slot *session_query;
+        sd_event_source *reconnect;
+        uint64_t session_generation, query_generation;
+        struct BackendRequest *backend_head, *backend_tail;
+        sd_json_variant *backend_result;
+        int listener_lock;
 } Manager;
 
 static Manager *manager_instance;
+
+static int identity_request(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_t method);
+static void runtime_event_queue(Manager *m, const char *description);
+static int backend_reply(sd_varlink *link, sd_json_variant *parameters);
 
 static uint64_t now_boottime(void) {
         struct timespec ts;
@@ -100,39 +117,7 @@ static uint64_t now_real(void) {
  * to the measurement log. The NV value is later AK-certified, binding "user X
  * authenticated on this attested boot" to the TPM. */
 static void record_runtime_event(Manager *m, const char *desc) {
-        RuntimeEvent *e;
-        uint8_t value[32];
-
-        if (m->n_runtime >= RUNTIME_LOG_MAX) {
-                if (!m->runtime_log_incomplete)
-                        sd_journal_print(LOG_ERR, "runtime measurement log limit reached");
-                m->runtime_log_incomplete = true;
-                return;
-        }
-
-        if (!(e = calloc(1, sizeof *e)) || !(e->desc = strdup(desc))) {
-                free(e);
-                m->runtime_log_incomplete = true;
-                sd_journal_print(LOG_ERR, "failed to allocate runtime measurement event");
-                return;
-        }
-        if (attest_nv_extend((const uint8_t *) desc, strlen(desc), value) < 0) {
-                free(e->desc);
-                free(e);
-                m->runtime_log_incomplete = true;
-                sd_journal_print(LOG_WARNING, "failed to extend runtime measurement");
-                return;
-        }
-
-        for (int i = 0; i < 32; i++)
-                snprintf(e->digest + 2 * i, 3, "%02x", value[i]);
-        e->when = now_real();
-        if (m->runtime_tail)
-                m->runtime_tail->next = e;
-        else
-                m->runtime_log = e;
-        m->runtime_tail = e;
-        m->n_runtime++;
+        runtime_event_queue(m, desc);
 }
 
 static int64_t seconds_since_verify(const TrackedSession *t) {
@@ -331,7 +316,7 @@ static const char *current_boot_quality(void) {
         return boot_reference_matches(hex) ? "verified-local" : "measured";
 }
 
-static int vl_get_measured_boot(sd_varlink *link, sd_json_variant *parameters,
+static int vl_get_measured_boot_run(sd_varlink *link, sd_json_variant *parameters,
                                 sd_varlink_method_flags_t flags, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *arr = NULL, *result = NULL;
         char pcr11[80] = "";
@@ -384,7 +369,7 @@ static int vl_get_measured_boot(sd_varlink *link, sd_json_variant *parameters,
                 SD_JSON_BUILD_PAIR("evidenceQuality", SD_JSON_BUILD_STRING(available ? "measured" : "observed")));
         if (r < 0)
                 return r;
-        return sd_varlink_reply(link, result);
+        return backend_reply(link, result);
 }
 
 /* --- session tracking -------------------------------------------------------- */
@@ -403,25 +388,66 @@ static TrackedSession *find_tracked_by_path(Manager *m, const char *path) {
         return NULL;
 }
 
-static int read_locked_hint(Manager *m, const char *path);
+static int on_locked_hint(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        TrackedSession *s = userdata;
+        int locked = -1;
+
+        s->lock_query = sd_bus_slot_unref(s->lock_query);
+        if (sd_bus_message_is_method_error(message, NULL) ||
+            sd_bus_message_enter_container(message, 'v', "b") < 0 ||
+            sd_bus_message_read(message, "b", &locked) <= 0)
+                locked = -1;
+        trust_session_set_lock(&s->state, locked);
+        if (locked != 0)
+                trust_session_invalidate_verification(&s->state);
+        return 0;
+}
+
+static void query_locked_hint(Manager *m, TrackedSession *s) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
+
+        s->lock_query = sd_bus_slot_unref(s->lock_query);
+        if (!m->bus || !s->path ||
+            sd_bus_message_new_method_call(m->bus, &request, "org.freedesktop.login1", s->path,
+                                           "org.freedesktop.DBus.Properties", "Get") < 0 ||
+            sd_bus_message_append(request, "ss", "org.freedesktop.login1.Session", "LockedHint") < 0 ||
+            sd_bus_call_async(m->bus, &s->lock_query, request, on_locked_hint, s, 2000000) < 0) {
+                trust_session_set_lock(&s->state, -1);
+                trust_session_invalidate_verification(&s->state);
+        }
+}
 
 static void track_session(Manager *m, const char *id, const char *path, int locked) {
-        TrackedSession *s;
+        TrackedSession *s = find_tracked(m, id);
+        char *copy;
 
-        if (find_tracked(m, id))
+        if (!trust_text_valid(id, 256) || !*id || !path)
                 return;
-        if (!(s = calloc(1, sizeof *s)))
+        if (s && s->path && streq(s->path, path))
                 return;
-        s->id = strdup(id);
-        s->path = path ? strdup(path) : NULL;
-        if (!s->id) {
-                free(s->path);
-                free(s);
+        copy = strdup(path);
+        if (!copy)
                 return;
+        if (!s) {
+                s = calloc(1, sizeof *s);
+                if (!s) {
+                        free(copy);
+                        return;
+                }
+                s->id = strdup(id);
+                if (!s->id) {
+                        free(copy);
+                        free(s);
+                        return;
+                }
+                s->next = m->sessions;
+                m->sessions = s;
         }
+        free(s->path);
+        s->path = copy;
         trust_session_set_lock(&s->state, locked);
-        s->next = m->sessions;
-        m->sessions = s;
+        trust_session_invalidate_verification(&s->state);
+        query_locked_hint(m, s);
 }
 
 static void untrack_by_path(Manager *m, const char *path) {
@@ -429,41 +455,23 @@ static void untrack_by_path(Manager *m, const char *path) {
                 if ((*pp)->path && streq((*pp)->path, path)) {
                         TrackedSession *s = *pp;
                         *pp = s->next;
+                        sd_bus_slot_unref(s->lock_query);
                         free(s->id);
                         free(s->path);
                         free(s);
                         return;
-        }
+                }
 }
 
 static TrackedSession *ensure_tracked_session(Manager *m, const char *id) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
-        _cleanup_free_ char *copy = NULL;
-        const char *path = NULL;
+        _cleanup_free_ char *path = NULL;
+        TrackedSession *s = find_tracked(m, id);
 
-        TrackedSession *tracked = find_tracked(m, id);
-        if (tracked)
-                return tracked;
-
-        if (m->bus &&
-            sd_bus_call_method(
-                            m->bus,
-                            "org.freedesktop.login1",
-                            "/org/freedesktop/login1",
-                            "org.freedesktop.login1.Manager",
-                            "GetSession",
-                            NULL,
-                            &reply,
-                            "s",
-                            id) >= 0 &&
-            sd_bus_message_read(reply, "o", &path) >= 0)
-                copy = strdup(path);
-
-        track_session(
-                        m,
-                        id,
-                        copy,
-                        copy ? read_locked_hint(m, copy) : -1);
+        if (s)
+                return s;
+        if (sd_bus_path_encode("/org/freedesktop/login1/session", id, &path) < 0)
+                return NULL;
+        track_session(m, id, path, -1);
         return find_tracked(m, id);
 }
 
@@ -474,86 +482,194 @@ static TrackedSession *ensure_tracked_session(Manager *m, const char *id) {
  * otherwise it is an ordinary nss/passwd identity (declared). We read only the
  * public signing key and never expose the record's privileged section. */
 
+static sd_json_variant *identity_find(uid_t uid) {
+        sd_json_variant *records = manager_instance->identities;
+
+        for (size_t i = 0; i < sd_json_variant_elements(records); i++) {
+                sd_json_variant *record = sd_json_variant_by_index(records, i);
+                sd_json_variant *id = sd_json_variant_by_key(record, "uid");
+
+                if (sd_json_variant_is_unsigned(id) && sd_json_variant_unsigned(id) == uid)
+                        return record;
+        }
+        return NULL;
+}
+
+static const char *identity_name(uid_t uid) {
+        sd_json_variant *name = sd_json_variant_by_key(identity_find(uid), "userName");
+
+        return sd_json_variant_is_string(name) ? sd_json_variant_string(name) : "";
+}
+
 static int userdb_query_identity(uid_t uid, bool *verified, char **source, char **signing_key) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
-        sd_json_variant *params, *record, *sig, *sig0, *key;
-        struct sockaddr_un sa = { .sun_family = AF_UNIX };
-        struct timeval tv = { .tv_sec = 2 };
-        _cleanup_free_ char *buf = NULL;
-        size_t buflen = 0, cap = 0;
-        char req[256];
-        int fd, len;
+        sd_json_variant *record = identity_find(uid), *v;
 
-        *verified = false;
-        *source = strdup("nss");
-        *signing_key = strdup("");
-        if (!*source || !*signing_key)
+        v = sd_json_variant_by_key(record, "verified");
+        *verified = sd_json_variant_is_boolean(v) && sd_json_variant_boolean(v);
+        v = sd_json_variant_by_key(record, "source");
+        *source = strdup(sd_json_variant_is_string(v) ? sd_json_variant_string(v) : "nss");
+        v = sd_json_variant_by_key(record, "signingKey");
+        *signing_key = strdup(sd_json_variant_is_string(v) ? sd_json_variant_string(v) : "");
+        return *source && *signing_key ? 0 : -ENOMEM;
+}
+
+typedef struct IdentityRequest {
+        struct IdentityRequest *next;
+        Worker *worker;
+        sd_varlink *link;
+        sd_json_variant *parameters;
+        sd_varlink_method_t method;
+        uid_t peer;
+} IdentityRequest;
+
+static int identity_read(uid_t uid, sd_json_variant **ret) {
+        _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *request = NULL;
+        _cleanup_free_ char *name = NULL;
+        sd_json_variant *record, *record_uid, *record_name, *reply = NULL;
+        const char *source = "nss", *key = NULL, *error = NULL;
+        struct passwd *pw = getpwuid(uid);
+        const char *address = "/run/systemd/userdb/io.systemd.Home";
+        uid_t peer;
+
+#ifdef TRUSTD_TESTING
+        address = getenv("PLATFORMD_TRUST_TEST_USERDB") ?: "/nonexistent/platformd-test-userdb";
+#endif
+        name = strdup(pw && pw->pw_name ? pw->pw_name : "");
+        if (!name)
                 return -ENOMEM;
-
-        /* A raw Varlink exchange (JSON + NUL) avoids re-entering the event loop
-         * through sd_varlink_call() from inside a Varlink handler. */
-        strncpy(sa.sun_path, "/run/systemd/userdb/io.systemd.Home", sizeof sa.sun_path - 1);
-        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-        if (fd < 0)
-                return 0;
-        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
-                close(fd);
-                return 0;   /* homed is not running */
-        }
-
-        len = snprintf(req, sizeof req,
-                "{\"method\":\"io.systemd.UserDatabase.GetUserRecord\","
-                "\"parameters\":{\"uid\":%u,\"service\":\"io.systemd.Home\"}}",
-                (unsigned) uid);
-        if (len < 0 || len >= (int) sizeof req || write(fd, req, (size_t) len + 1) != (ssize_t) len + 1) {
-                close(fd);
-                return 0;
-        }
-        for (;;) {   /* read the reply up to its terminating NUL */
-                char chunk[1024];
-                ssize_t n = read(fd, chunk, sizeof chunk);
-                char *nb;
-
-                if (n <= 0)
-                        break;
-                if (buflen + (size_t) n + 1 > cap) {
-                        cap = (buflen + (size_t) n + 1) * 2;
-                        if (!(nb = realloc(buf, cap))) {
-                                close(fd);
-                                return 0;
-                        }
-                        buf = nb;
+        if (sd_varlink_connect_address(&link, address) >= 0 &&
+            sd_varlink_get_peer_uid(link, &peer) >= 0 && peer == 0 &&
+            sd_varlink_set_relative_timeout(link, 2000000) >= 0 &&
+            sd_json_buildo(&request, SD_JSON_BUILD_PAIR_UNSIGNED("uid", uid),
+                          SD_JSON_BUILD_PAIR_STRING("service", "io.systemd.Home")) >= 0 &&
+            sd_varlink_call(link, "io.systemd.UserDatabase.GetUserRecord", request, &reply, &error) >= 0 &&
+            !error) {
+                record = sd_json_variant_by_key(reply, "record");
+                sd_json_variant_sensitive(record);
+                record_uid = sd_json_variant_by_key(record, "uid");
+                record_name = sd_json_variant_by_key(record, "userName");
+                if (sd_json_variant_is_unsigned(record_uid) && sd_json_variant_unsigned(record_uid) == uid &&
+                    sd_json_variant_is_string(record_name) &&
+                    streq(sd_json_variant_string(record_name), name)) {
+                        source = "homed";
+                        key = user_record_signing_key(record);
                 }
-                memcpy(buf + buflen, chunk, (size_t) n);
-                buflen += (size_t) n;
-                if (memchr(chunk, 0, (size_t) n))
-                        break;
         }
-        close(fd);
-        if (!buf)
-                return 0;
-        buf[buflen] = 0;
+        return sd_json_buildo(ret,
+                             SD_JSON_BUILD_PAIR_UNSIGNED("uid", uid),
+                             SD_JSON_BUILD_PAIR_STRING("userName", name),
+                             SD_JSON_BUILD_PAIR_STRING("source", source),
+                             SD_JSON_BUILD_PAIR_BOOLEAN("verified", key != NULL),
+                             SD_JSON_BUILD_PAIR_STRING("signingKey", key ?: ""));
+}
 
-        if (sd_json_parse(buf, 0, &reply, NULL, NULL) < 0 || sd_json_variant_by_key(reply, "error"))
-                return 0;   /* no homed record for this user ID */
-        params = sd_json_variant_by_key(reply, "parameters");
-        record = params ? sd_json_variant_by_key(params, "record") : NULL;
-        sig = record ? sd_json_variant_by_key(record, "signature") : NULL;
-        sig0 = sig && sd_json_variant_is_array(sig) && sd_json_variant_elements(sig) > 0
-                ? sd_json_variant_by_index(sig, 0) : NULL;
-        if (sig0) {
-                free(*source);
-                *source = strdup("homed");
-                key = sd_json_variant_by_key(sig0, "key");
-                if (key && sd_json_variant_is_string(key)) {
-                        free(*signing_key);
-                        *signing_key = strdup(sd_json_variant_string(key));
-                }
-                *verified = user_record_verify(record);   /* verify the Ed25519 signature in-process */
+static int identity_run(void *userdata, sd_json_variant **ret) {
+        IdentityRequest *q = userdata;
+        sd_json_variant *p = sd_json_variant_by_key(q->parameters, "uid");
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL;
+        char **sessions = NULL;
+        int n, r;
+
+        if (sd_json_variant_by_key(q->parameters, "policy")) {
+                r = sd_json_buildo(&record, SD_JSON_BUILD_PAIR_STRING("bootQuality", current_boot_quality()));
+                if (r < 0 || (r = sd_json_variant_append_array(ret, record)) < 0)
+                        return r;
+                record = sd_json_variant_unref(record);
         }
-        return 0;
+        if (sd_json_variant_is_unsigned(p)) {
+                r = identity_read((uid_t) sd_json_variant_unsigned(p), &record);
+                return r < 0 ? r : sd_json_variant_append_array(ret, record);
+        }
+        p = sd_json_variant_by_key(q->parameters, "sessionId");
+        if (sd_json_variant_is_string(p)) {
+                uid_t uid;
+
+                if (sd_session_get_uid(sd_json_variant_string(p), &uid) < 0)
+                        return *ret ? 0 : sd_json_variant_new_array(ret, NULL, 0);
+                r = identity_read(uid, &record);
+                return r < 0 ? r : sd_json_variant_append_array(ret, record);
+        }
+        n = sd_get_sessions(&sessions);
+        if (n < 0)
+                return n;
+        r = n > 256 ? -E2BIG : sd_json_variant_new_array(ret, NULL, 0);
+        for (int i = 0; i < n; i++) {
+                uid_t uid;
+
+                if (r >= 0 && sd_session_get_uid(sessions[i], &uid) >= 0) {
+                        record = sd_json_variant_unref(record);
+                        r = identity_read(uid, &record);
+                        if (r >= 0)
+                                r = sd_json_variant_append_array(ret, record);
+                }
+                free(sessions[i]);
+        }
+        free(sessions);
+        return r;
+}
+
+static void identity_free(IdentityRequest *q) {
+        if (!q)
+                return;
+        worker_free(q->worker);
+        sd_varlink_unref(q->link);
+        sd_json_variant_unref(q->parameters);
+        free(q);
+}
+
+static void identity_done(int error, sd_json_variant *result, void *userdata) {
+        IdentityRequest *q = userdata;
+        Manager *m = manager_instance;
+        int r;
+
+        for (IdentityRequest **p = &m->identity_requests; *p; p = &(*p)->next)
+                if (*p == q) {
+                        *p = q->next;
+                        break;
+                }
+        if (error < 0)
+                (void) sd_varlink_error_errno(q->link, error);
+        else {
+                m->identities = result;
+                r = q->method(q->link, q->parameters, 0, m);
+                m->identities = NULL;
+                if (r < 0)
+                        (void) sd_varlink_error_errno(q->link, r);
+        }
+        identity_free(q);
+}
+
+static int identity_request(sd_varlink *link, sd_json_variant *parameters, sd_varlink_method_t method) {
+        Manager *m = manager_instance;
+        IdentityRequest *q;
+        uid_t peer;
+        unsigned total = 0, owned = 0;
+        int r;
+
+        if (sd_varlink_get_peer_uid(link, &peer) < 0)
+                return -EIO;
+        for (q = m->identity_requests; q; q = q->next) {
+                total++;
+                owned += q->peer == peer;
+        }
+        if (total >= 16 || owned >= 4)
+                return -EBUSY;
+        q = calloc(1, sizeof *q);
+        if (!q)
+                return -ENOMEM;
+        q->link = sd_varlink_ref(link);
+        q->parameters = sd_json_variant_ref(parameters);
+        q->method = method;
+        q->peer = peer;
+        r = worker_start(m->event, 2000000, identity_run, identity_done, q, &q->worker);
+        if (r < 0) {
+                identity_free(q);
+                return r;
+        }
+        q->next = m->identity_requests;
+        m->identity_requests = q;
+        return 1;
 }
 
 /* --- session records --------------------------------------------------------- */
@@ -562,7 +678,6 @@ static int session_to_json(Manager *m, const char *id, sd_json_variant **ret) {
         _cleanup_free_ char *seat = NULL, *type = NULL, *class = NULL, *state = NULL, *tty = NULL;
         TrackedSession *t = find_tracked(m, id);
         const char *lock_state, *verification_quality, *verification_source;
-        struct passwd *pw;
         uid_t uid = 0;
         pid_t leader = 0;
         int active, remote;
@@ -576,7 +691,6 @@ static int session_to_json(Manager *m, const char *id, sd_json_variant **ret) {
         (void) sd_session_get_leader(id, &leader);
         active = sd_session_is_active(id);
         remote = sd_session_is_remote(id);
-        pw = getpwuid(uid);
 
         bool user_verified = false;
         _cleanup_free_ char *user_source = NULL, *signing_key = NULL;
@@ -592,7 +706,7 @@ static int session_to_json(Manager *m, const char *id, sd_json_variant **ret) {
         return sd_json_buildo(ret,
                 SD_JSON_BUILD_PAIR("id", SD_JSON_BUILD_STRING(id)),
                 SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)),
-                SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(pw && pw->pw_name ? pw->pw_name : "")),
+                SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(identity_name(uid))),
                 SD_JSON_BUILD_PAIR("seat", SD_JSON_BUILD_STRING(seat ?: "")),
                 SD_JSON_BUILD_PAIR("type", SD_JSON_BUILD_STRING(type ?: "")),
                 SD_JSON_BUILD_PAIR("class", SD_JSON_BUILD_STRING(class ?: "")),
@@ -620,6 +734,8 @@ static int vl_list_sessions(sd_varlink *link, sd_json_variant *parameters,
         char **ids = NULL;
         int n, r = 0;
 
+        if (!manager_instance->identities)
+                return identity_request(link, parameters, vl_list_sessions);
         n = sd_get_sessions(&ids);
         if (n < 0)
                 return n;
@@ -658,6 +774,8 @@ static int vl_get_session_trust(sd_varlink *link, sd_json_variant *parameters,
         if (sd_session_get_uid(sid, &uid) < 0)
                 return sd_varlink_error(link, "io.platformd.Trust.NoSuchSession", NULL);
 
+        if (!manager_instance->identities)
+                return identity_request(link, parameters, vl_get_session_trust);
         if ((r = session_to_json(manager_instance, sid, &s)) < 0)
                 return r;
         r = sd_json_buildo(&result, SD_JSON_BUILD_PAIR("session", SD_JSON_BUILD_VARIANT(s)));
@@ -673,21 +791,21 @@ static int vl_get_user_identity(sd_varlink *link, sd_json_variant *parameters,
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_free_ char *source = NULL, *key = NULL;
         sd_json_variant *p;
-        struct passwd *pw;
         uid_t uid;
         bool verified = false;
         int r;
 
         p = sd_json_variant_by_key(parameters, "uid");
-        if (!p || !sd_json_variant_is_unsigned(p))
+        if (!p || !sd_json_variant_is_unsigned(p) || sd_json_variant_unsigned(p) >= (uid_t) -1)
                 return sd_varlink_error_invalid_parameter_name(link, "uid");
         uid = (uid_t) sd_json_variant_unsigned(p);
 
+        if (!manager_instance->identities)
+                return identity_request(link, parameters, vl_get_user_identity);
         (void) userdb_query_identity(uid, &verified, &source, &key);
-        pw = getpwuid(uid);
 
         r = sd_json_buildo(&result,
-                SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(pw && pw->pw_name ? pw->pw_name : "")),
+                SD_JSON_BUILD_PAIR("userName", SD_JSON_BUILD_STRING(identity_name(uid))),
                 SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)),
                 SD_JSON_BUILD_PAIR("source", SD_JSON_BUILD_STRING(source ?: "")),
                 SD_JSON_BUILD_PAIR("verified", SD_JSON_BUILD_BOOLEAN(verified)),
@@ -733,7 +851,17 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
         if (!trust_text_valid(sid, 256))
                 return sd_varlink_error_invalid_parameter_name(link, "sessionId");
 
-        input.boot_verified = streq(current_boot_quality(), "verified-local");
+        if (!streq(policy, "fresh-user-verification") && !streq(policy, "local-trusted-session") &&
+            !streq(policy, "verified-boot"))
+                return sd_varlink_error(link, "io.platformd.Trust.UnknownPolicy", NULL);
+        if (!streq(policy, "fresh-user-verification") && !m->identities)
+                return identity_request(link, parameters, vl_evaluate_policy);
+        if (!streq(policy, "fresh-user-verification")) {
+                sd_json_variant *quality = sd_json_variant_by_key(
+                                sd_json_variant_by_index(m->identities, 0), "bootQuality");
+                input.boot_verified = sd_json_variant_is_string(quality) &&
+                                      streq(sd_json_variant_string(quality), "verified-local");
+        }
         if (*sid && sd_session_get_uid(sid, &uid) >= 0) {
                 TrackedSession *tracked = find_tracked(m, sid);
 
@@ -776,143 +904,211 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
 
 /* --- logind tracking --------------------------------------------------------- */
 
-static int on_props(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
-        Manager *m = userdata;
-        TrackedSession *t = find_tracked_by_path(userdata, sd_bus_message_get_path(msg));
-        const char *iface;
-        bool invalidated = false;
-        int locked = -1;
+static void setup_logind(Manager *m);
+static int enumerate_sessions(Manager *m);
 
-        if (!t || sd_bus_message_read(msg, "s", &iface) < 0 ||
-            !streq(iface, "org.freedesktop.login1.Session"))
+static void forget_sessions(Manager *m) {
+        m->session_query = sd_bus_slot_unref(m->session_query);
+        while (m->sessions)
+                untrack_by_path(m, m->sessions->path);
+}
+
+static int on_props(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        TrackedSession *s = find_tracked_by_path(m, sd_bus_message_get_path(msg));
+        const char *interface, *key;
+        bool changed = false;
+        int locked = -1, r;
+
+        if (!s || sd_bus_message_read(msg, "s", &interface) <= 0 ||
+            !streq(interface, "org.freedesktop.login1.Session"))
                 return 0;
-        if (sd_bus_message_enter_container(msg, 'a', "{sv}") < 0)
-                return 0;
-        while (sd_bus_message_enter_container(msg, 'e', "sv") > 0) {
-                const char *key;
-                if (sd_bus_message_read(msg, "s", &key) < 0)
-                        break;
+        if (sd_bus_message_enter_container(msg, 'a', "{sv}") <= 0)
+                goto invalid;
+        while ((r = sd_bus_message_enter_container(msg, 'e', "sv")) > 0) {
+                if (sd_bus_message_read(msg, "s", &key) <= 0)
+                        goto invalid;
                 if (streq(key, "LockedHint")) {
-                        int v = 0;
-                        if (sd_bus_message_enter_container(msg, 'v', "b") >= 0 &&
-                            sd_bus_message_read(msg, "b", &v) >= 0) {
-                                (void) sd_bus_message_exit_container(msg);
-                                locked = v;
-                        }
-                } else
-                        (void) sd_bus_message_skip(msg, "v");
-                (void) sd_bus_message_exit_container(msg);
+                        if (changed || sd_bus_message_enter_container(msg, 'v', "b") <= 0 ||
+                            sd_bus_message_read(msg, "b", &locked) <= 0 ||
+                            sd_bus_message_exit_container(msg) < 0)
+                                goto invalid;
+                        changed = true;
+                } else if (sd_bus_message_skip(msg, "v") < 0)
+                        goto invalid;
+                if (sd_bus_message_exit_container(msg) < 0)
+                        goto invalid;
         }
-        (void) sd_bus_message_exit_container(msg);
-        if (sd_bus_message_enter_container(msg, 'a', "s") >= 0) {
-                const char *key;
+        if (r < 0 || sd_bus_message_exit_container(msg) < 0 ||
+            sd_bus_message_enter_container(msg, 'a', "s") <= 0)
+                goto invalid;
+        while ((r = sd_bus_message_read(msg, "s", &key)) > 0)
+                if (streq(key, "LockedHint"))
+                        goto invalid;
+        if (r < 0)
+                goto invalid;
+        if (!changed)
+                return 0;
+        goto update;
+invalid:
+        locked = -1;
+update:
+        s->lock_query = sd_bus_slot_unref(s->lock_query);
+        trust_session_set_lock(&s->state, locked);
+        if (locked != 0)
+                trust_session_invalidate_verification(&s->state);
+        {
+                char description[320];
 
-                while (sd_bus_message_read(msg, "s", &key) > 0)
-                        if (streq(key, "LockedHint"))
-                                invalidated = true;
-                (void) sd_bus_message_exit_container(msg);
-        }
-        if (locked >= 0 && t->state.lock_state != locked) {
-                char desc[160];
-
-                trust_session_set_lock(&t->state, locked);
-                snprintf(
-                                desc,
-                                sizeof desc,
-                                "lock-state session=%s state=%s",
-                                t->id,
-                                locked ? "locked" : "unlocked");
-                record_runtime_event(m, desc);
-        } else if (invalidated && t->state.lock_state >= 0) {
-                char desc[160];
-
-                trust_session_set_lock(&t->state, -1);
-                snprintf(desc, sizeof desc, "lock-state session=%s state=unknown", t->id);
-                record_runtime_event(m, desc);
+                snprintf(description, sizeof description, "lock-state session=%s state=%s", s->id,
+                         locked < 0 ? "unknown" : locked ? "locked" : "unlocked");
+                record_runtime_event(m, description);
         }
         return 0;
 }
 
-static int read_locked_hint(Manager *m, const char *path) {
-        int locked = 0;
-
-        if (sd_bus_get_property_trivial(
-                        m->bus,
-                        "org.freedesktop.login1",
-                        path,
-                        "org.freedesktop.login1.Session",
-                        "LockedHint",
-                        NULL,
-                        'b',
-                        &locked) < 0)
-                return -1;
-        return locked;
-}
-
-static int on_session_new(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
+static int on_session_new(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
         const char *id, *path;
 
-        if (sd_bus_message_read(msg, "so", &id, &path) >= 0)
-                track_session(m, id, path, read_locked_hint(m, path));
+        m->session_generation++;
+        if (sd_bus_message_read(msg, "so", &id, &path) > 0)
+                track_session(m, id, path, -1);
         return 0;
 }
 
-static int on_session_removed(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
+static int on_session_removed(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
         const char *id, *path;
-        if (sd_bus_message_read(msg, "so", &id, &path) >= 0)
-                untrack_by_path(userdata, path);
+
+        m->session_generation++;
+        if (sd_bus_message_read(msg, "so", &id, &path) > 0)
+                untrack_by_path(m, path);
         return 0;
 }
 
-static int on_prepare_for_sleep(sd_bus_message *msg, void *userdata, sd_bus_error *e) {
+static int on_prepare_for_sleep(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
         int sleeping;
 
-        if (sd_bus_message_read(msg, "b", &sleeping) < 0 || !sleeping)
+        if (sd_bus_message_read(msg, "b", &sleeping) <= 0 || !sleeping)
                 return 0;
-
         for (TrackedSession *s = m->sessions; s; s = s->next)
                 trust_session_invalidate_verification(&s->state);
-
         record_runtime_event(m, "sleep freshness=invalidated");
-        sd_journal_print(LOG_INFO, "invalidated session freshness before sleep");
         return 0;
 }
 
-/* Best-effort: without a system bus or logind, session state is simply absent. */
-static void setup_logind(Manager *m) {
-        _cleanup_(sd_bus_message_unrefp) sd_bus_message *reply = NULL;
+static int on_sessions(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        const char *id, *user, *seat, *path;
+        uint32_t uid;
         int r;
 
-        if (sd_bus_open_system(&m->bus) < 0 ||
-            sd_bus_attach_event(m->bus, m->event, SD_EVENT_PRIORITY_NORMAL) < 0) {
-                sd_journal_print(LOG_INFO, "system bus unavailable, session state is unavailable");
-                m->bus = sd_bus_flush_close_unref(m->bus);
-                return;
+        m->session_query = sd_bus_slot_unref(m->session_query);
+        if (m->query_generation != m->session_generation) {
+                (void) enumerate_sessions(m);
+                return 0;
         }
+        if (sd_bus_message_is_method_error(msg, NULL) ||
+            sd_bus_message_enter_container(msg, 'a', "(susso)") <= 0)
+                return 0;
+        while ((r = sd_bus_message_read(msg, "(susso)", &id, &uid, &user, &seat, &path)) > 0)
+                track_session(m, id, path, -1);
+        if (r < 0)
+                forget_sessions(m);
+        return 0;
+}
 
-        r = sd_bus_call_method(m->bus, "org.freedesktop.login1", "/org/freedesktop/login1",
-                               "org.freedesktop.login1.Manager", "ListSessions", NULL, &reply, "");
-        if (r >= 0 && sd_bus_message_enter_container(reply, 'a', "(susso)") >= 0) {
-                const char *id, *user, *seat, *path;
-                uint32_t uid;
-                while (sd_bus_message_read(reply, "(susso)", &id, &uid, &user, &seat, &path) > 0) {
-                        track_session(m, id, path, read_locked_hint(m, path));
-                }
-                (void) sd_bus_message_exit_container(reply);
-        }
+static int enumerate_sessions(Manager *m) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
+        int r;
 
-        (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", NULL,
-                        "org.freedesktop.DBus.Properties", "PropertiesChanged", on_props, m);
-        (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager", "SessionNew", on_session_new, m);
-        (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager", "SessionRemoved", on_session_removed, m);
-        (void) sd_bus_match_signal(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
-                        "org.freedesktop.login1.Manager", "PrepareForSleep", on_prepare_for_sleep, m);
+        m->session_query = sd_bus_slot_unref(m->session_query);
+        m->query_generation = m->session_generation;
+        r = sd_bus_message_new_method_call(m->bus, &request, "org.freedesktop.login1",
+                                          "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "ListSessions");
+        if (r < 0)
+                return r;
+        return sd_bus_call_async(m->bus, &m->session_query, request, on_sessions, m, 2000000);
+}
 
-        sd_journal_print(LOG_INFO, "tracking logind session and lock state");
+static int on_logind_owner(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        const char *name, *old_owner, *new_owner;
+
+        if (sd_bus_message_read(msg, "sss", &name, &old_owner, &new_owner) <= 0 ||
+            !streq(name, "org.freedesktop.login1") || streq(old_owner, new_owner))
+                return 0;
+        m->session_generation++;
+        forget_sessions(m);
+        if (*new_owner)
+                (void) enumerate_sessions(m);
+        return 0;
+}
+
+static int on_bus_disconnected(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+
+        forget_sessions(m);
+        return sd_event_exit(m->event, EXIT_FAILURE);
+}
+
+static int on_match_installed(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
+        if (sd_bus_message_is_method_error(msg, NULL))
+                return on_bus_disconnected(msg, userdata, error);
+        return 0;
+}
+
+static int on_reconnect(sd_event_source *source, uint64_t usec, void *userdata) {
+        Manager *m = userdata;
+
+        m->reconnect = sd_event_source_unref(m->reconnect);
+        setup_logind(m);
+        return 0;
+}
+
+static void setup_logind(Manager *m) {
+        int r;
+
+        r = sd_bus_open_system(&m->bus);
+        if (r < 0 || sd_bus_attach_event(m->bus, m->event, SD_EVENT_PRIORITY_NORMAL) < 0)
+                goto fail;
+        r = sd_bus_match_signal_async(m->bus, NULL, "org.freedesktop.login1", NULL,
+                                     "org.freedesktop.DBus.Properties", "PropertiesChanged",
+                                     on_props, on_match_installed, m);
+        if (r < 0)
+                goto fail;
+        r = sd_bus_match_signal_async(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                     "org.freedesktop.login1.Manager", "SessionNew",
+                                     on_session_new, on_match_installed, m);
+        if (r < 0)
+                goto fail;
+        r = sd_bus_match_signal_async(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                     "org.freedesktop.login1.Manager", "SessionRemoved",
+                                     on_session_removed, on_match_installed, m);
+        if (r < 0)
+                goto fail;
+        r = sd_bus_match_signal_async(m->bus, NULL, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                     "org.freedesktop.login1.Manager", "PrepareForSleep",
+                                     on_prepare_for_sleep, on_match_installed, m);
+        if (r < 0)
+                goto fail;
+        r = sd_bus_match_signal_async(m->bus, NULL, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                     "org.freedesktop.DBus", "NameOwnerChanged",
+                                     on_logind_owner, on_match_installed, m);
+        if (r < 0)
+                goto fail;
+        r = sd_bus_match_signal(m->bus, NULL, NULL, "/org/freedesktop/DBus/Local",
+                               "org.freedesktop.DBus.Local", "Disconnected", on_bus_disconnected, m);
+        if (r < 0 || enumerate_sessions(m) < 0)
+                goto fail;
+        return;
+fail:
+        forget_sessions(m);
+        m->bus = sd_bus_flush_close_unref(m->bus);
+        (void) sd_event_add_time(m->event, &m->reconnect, CLOCK_BOOTTIME, now_boottime() + 5000000,
+                                0, on_reconnect, m);
 }
 
 /* --- authentication events --------------------------------------------------- */
@@ -967,10 +1163,9 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                                 sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = manager_instance;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = NULL;
-        _cleanup_free_ char *class = NULL;
+        _cleanup_free_ char *class = NULL, *session_user = NULL;
         const char *user, *service, *tty, *rhost, *phase, *method, *result, *session;
         TrackedSession *tracked;
-        struct passwd *pw;
         sd_json_variant *p;
         AuthEvent *e = NULL;
         uint64_t uid_value;
@@ -1011,12 +1206,11 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
         if (uid_value > (uint64_t) (uid_t) -2)
                 return sd_varlink_error_invalid_parameter_name(link, "uid");
 
-        pw = getpwuid((uid_t) uid_value);
-        if (!pw || !pw->pw_name || !streq(user, pw->pw_name))
-                return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
         if (sd_session_get_uid(session, &session_uid) < 0)
                 return sd_varlink_error(link, "io.platformd.Trust.NoSuchSession", NULL);
         if (session_uid != (uid_t) uid_value)
+                return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
+        if (sd_session_get_username(session, &session_user) < 0 || !streq(user, session_user))
                 return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
 
         class_eligible =
@@ -1117,7 +1311,26 @@ static int vl_list_auth_events(sd_varlink *link, sd_json_variant *parameters,
         return sd_varlink_reply(link, result);
 }
 
-static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
+static int backend_reply(sd_varlink *link, sd_json_variant *parameters) {
+        return sd_json_buildo(&manager_instance->backend_result,
+                             SD_JSON_BUILD_PAIR_VARIANT("parameters", parameters));
+}
+
+static int backend_error(sd_varlink *link, const char *error, sd_json_variant *parameters) {
+        return sd_json_buildo(&manager_instance->backend_result,
+                             SD_JSON_BUILD_PAIR_STRING("error", error),
+                             SD_JSON_BUILD_PAIR_VARIANT("parameters", parameters));
+}
+
+static int backend_invalid(sd_varlink *link, const char *name) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *parameters = NULL;
+        int r;
+
+        r = sd_json_buildo(&parameters, SD_JSON_BUILD_PAIR_STRING("parameter", name));
+        return r < 0 ? r : backend_error(link, "org.varlink.service.InvalidParameter", parameters);
+}
+
+static int vl_get_runtime_log_run(sd_varlink *link, sd_json_variant *parameters,
                               sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = manager_instance;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *arr = NULL, *result = NULL;
@@ -1144,6 +1357,7 @@ static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
                         snprintf(current + 2 * i, 3, "%02x", nvval[i]);
         else
                 complete = false;
+        complete = complete && streq(current, m->runtime_tail ? m->runtime_tail->digest : m->baseline_runtime);
         r = sd_json_buildo(&result,
                 SD_JSON_BUILD_PAIR("nvIndex", SD_JSON_BUILD_STRING("0x01800001")),
                 SD_JSON_BUILD_PAIR("baseline", SD_JSON_BUILD_STRING(m->baseline_runtime)),
@@ -1155,7 +1369,7 @@ static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
                                 m->n_runtime > 0 ? "measured" : "observed")));
         if (r < 0)
                 return r;
-        return sd_varlink_reply(link, result);
+        return backend_reply(link, result);
 }
 
 /* --- attestation ------------------------------------------------------------- */
@@ -1250,7 +1464,7 @@ static char *read_event_log_hex(void) {
         }
 }
 
-static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
+static int vl_attest_run(sd_varlink *link, sd_json_variant *parameters,
                      sd_varlink_method_flags_t flags, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_free_ uint8_t *nonce = NULL, *ak = NULL, *quoted = NULL, *sig = NULL;
@@ -1259,19 +1473,17 @@ static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
         sd_json_variant *p;
         int r;
 
-        if (!peer_is_root(link))
-                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         p = sd_json_variant_by_key(parameters, "nonceHex");
         if (!p || !sd_json_variant_is_string(p) ||
             hex_decode(sd_json_variant_string(p), &nonce, &nonce_len) < 0 || nonce_len > 64)
-                return sd_varlink_error_invalid_parameter_name(link, "nonceHex");
+                return backend_invalid(link, "nonceHex");
 
         r = attest_quote(nonce, nonce_len, &ak, &ak_len, &quoted, &quoted_len, &sig, &sig_len);
-        if (r == -ENOTSUP)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
+        if (r == -ENOTSUP || r == -ENODEV)
+                return backend_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
         if (r < 0)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         ak_hex = hex_encode(ak, ak_len);
         quoted_hex = hex_encode(quoted, quoted_len);
@@ -1290,26 +1502,22 @@ static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
         if (r < 0)
                 return r;
         sd_journal_send("MESSAGE=attestation quote produced", "PLATFORMD_EVENT=attest", NULL);
-        return sd_varlink_reply(link, result);
+        return backend_reply(link, result);
 }
 
-/* Assemble an IETF RATS Entity Attestation Token (RFC 9711, JSON profile): the
- * standard EAT claims plus the complete evidence as `measurements`: the AK-signed
- * TPM quote (the anchor), the boot PCRs + quality, and the runtime auth log. A
- * RATS Verifier consumes this directly: check the quote signature against cnf,
- * confirm the nonce, then replay the PCRs/runtime log against the quoted digest. */
-static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameters,
+/* The envelope is unsigned. Only the embedded TPM structures are signed. */
+static int vl_get_attestation_token_run(sd_varlink *link, sd_json_variant *parameters,
                                     sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = manager_instance;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *eat = NULL, *result = NULL,
                 *pcrs = NULL, *revents = NULL, *measurements = NULL,
-                *quote_m = NULL, *boot_m = NULL, *runtime_m = NULL, *cnf = NULL;
+                *quote_m = NULL, *boot_m = NULL, *runtime_m = NULL, *cnf = NULL, *observations = NULL;
         _cleanup_free_ uint8_t *nonce = NULL, *ak = NULL, *quoted = NULL, *sig = NULL,
-                *nv_ak = NULL, *nv_ci = NULL, *nv_sig = NULL;
+                *nv_ak = NULL, *nv_ci = NULL, *nv_sig = NULL, *nv_public = NULL;
         _cleanup_free_ char *ak_hex = NULL, *quoted_hex = NULL, *sig_hex = NULL, *eat_str = NULL,
-                *nv_ci_hex = NULL, *nv_sig_hex = NULL;
+                *nv_ci_hex = NULL, *nv_sig_hex = NULL, *nv_public_hex = NULL;
         size_t nonce_len = 0, ak_len = 0, quoted_len = 0, sig_len = 0,
-                nv_ak_len = 0, nv_ci_len = 0, nv_sig_len = 0;
+                nv_ak_len = 0, nv_ci_len = 0, nv_sig_len = 0, nv_public_len = 0;
         char machine_str[SD_ID128_STRING_MAX], nv_current[65] = "";
         uint8_t nvval[32];
         const char *nonce_hex, *sb;
@@ -1317,21 +1525,19 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
         sd_json_variant *p;
         int r;
 
-        if (!peer_is_root(link))
-                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
         if (m->runtime_log_incomplete)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         p = sd_json_variant_by_key(parameters, "nonceHex");
         if (!p || !sd_json_variant_is_string(p) ||
             hex_decode((nonce_hex = sd_json_variant_string(p)), &nonce, &nonce_len) < 0 || nonce_len > 64)
-                return sd_varlink_error_invalid_parameter_name(link, "nonceHex");
+                return backend_invalid(link, "nonceHex");
 
         r = attest_quote(nonce, nonce_len, &ak, &ak_len, &quoted, &quoted_len, &sig, &sig_len);
-        if (r == -ENOTSUP)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
+        if (r == -ENOTSUP || r == -ENODEV)
+                return backend_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
         if (r < 0)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
         if (!(ak_hex = hex_encode(ak, ak_len)) ||
             !(quoted_hex = hex_encode(quoted, quoted_len)) ||
             !(sig_hex = hex_encode(sig, sig_len)))
@@ -1344,10 +1550,14 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
             nv_ak_len != ak_len || memcmp(nv_ak, ak, ak_len) != 0 ||
             !(nv_ci_hex = hex_encode(nv_ci, nv_ci_len)) ||
             !(nv_sig_hex = hex_encode(nv_sig, nv_sig_len)) ||
-            attest_nv_read(nvval) < 0)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+            attest_nv_read(nvval) < 0 ||
+            attest_nv_public(&nv_public, &nv_public_len) < 0 ||
+            !(nv_public_hex = hex_encode(nv_public, nv_public_len)))
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
         for (int i = 0; i < 32; i++)
                 snprintf(nv_current + 2 * i, 3, "%02x", nvval[i]);
+        if (!streq(nv_current, m->runtime_tail ? m->runtime_tail->digest : m->baseline_runtime))
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         for (int i = 0; i <= 15; i++) {   /* boot PCRs the quote covers (runtime is in NV) */
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *o = NULL;
@@ -1394,6 +1604,7 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
                         SD_JSON_BUILD_PAIR("baseline", SD_JSON_BUILD_STRING(m->baseline_runtime)),
                         SD_JSON_BUILD_PAIR("current", SD_JSON_BUILD_STRING(nv_current)),
                         SD_JSON_BUILD_PAIR("certifyInfo", SD_JSON_BUILD_STRING(nv_ci_hex ?: "")),
+                        SD_JSON_BUILD_PAIR("nvPublicHex", SD_JSON_BUILD_STRING(nv_public_hex)),
                         SD_JSON_BUILD_PAIR("signature", SD_JSON_BUILD_STRING(nv_sig_hex ?: "")),
                         SD_JSON_BUILD_PAIR("events", SD_JSON_BUILD_VARIANT(revents)))) < 0)
                 return r;
@@ -1408,13 +1619,17 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
         if (sd_id128_get_machine(&machine) >= 0)
                 sd_id128_to_string(machine, machine_str);
 
+        r = sd_json_buildo(&observations,
+                          SD_JSON_BUILD_PAIR_STRING("machineId", machine_str),
+                          SD_JSON_BUILD_PAIR_UNSIGNED("realtimeUSec", now_real()),
+                          SD_JSON_BUILD_PAIR_STRING("secureBoot", sb));
+        if (r < 0)
+                return r;
         r = sd_json_buildo(&eat,
-                SD_JSON_BUILD_PAIR("eat_profile", SD_JSON_BUILD_STRING("https://platformd.io/trust/eat/v1")),
-                SD_JSON_BUILD_PAIR("eat_nonce", SD_JSON_BUILD_STRING(nonce_hex)),
-                SD_JSON_BUILD_PAIR("ueid", SD_JSON_BUILD_STRING(machine_str)),
-                SD_JSON_BUILD_PAIR("iat", SD_JSON_BUILD_UNSIGNED(now_real() / 1000000)),
-                SD_JSON_BUILD_PAIR("dbgstat", SD_JSON_BUILD_STRING(streq(sb, "enabled") ? "disabled" : "not-disabled")),
-                SD_JSON_BUILD_PAIR("cnf", SD_JSON_BUILD_VARIANT(cnf)),
+                SD_JSON_BUILD_PAIR_STRING("profile", "io.platformd.Trust.Attestation.v1"),
+                SD_JSON_BUILD_PAIR_STRING("nonceHex", nonce_hex),
+                SD_JSON_BUILD_PAIR_VARIANT("localAssertions", observations),
+                SD_JSON_BUILD_PAIR("attestationKey", SD_JSON_BUILD_VARIANT(cnf)),
                 SD_JSON_BUILD_PAIR("measurements", SD_JSON_BUILD_VARIANT(measurements)));
         if (r < 0)
                 return r;
@@ -1423,17 +1638,17 @@ static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameter
 
         r = sd_json_buildo(&result,
                 SD_JSON_BUILD_PAIR("eat", SD_JSON_BUILD_STRING(eat_str)),
-                SD_JSON_BUILD_PAIR("format", SD_JSON_BUILD_STRING("application/eat+json")),
+                SD_JSON_BUILD_PAIR("format", SD_JSON_BUILD_STRING("application/vnd.platformd.attestation+json")),
                 SD_JSON_BUILD_PAIR("evidenceQuality", SD_JSON_BUILD_STRING("measured")));
         if (r < 0)
                 return r;
-        sd_journal_send("MESSAGE=attestation token (EAT) produced", "PLATFORMD_EVENT=attest-eat", NULL);
-        return sd_varlink_reply(link, result);
+        sd_journal_send("MESSAGE=attestation evidence produced", "PLATFORMD_EVENT=attest", NULL);
+        return backend_reply(link, result);
 }
 
 /* --- AK enrollment: bind the attestation key to a genuine TPM ----------------- */
 
-static int vl_get_enrollment(sd_varlink *link, sd_json_variant *parameters,
+static int vl_get_enrollment_run(sd_varlink *link, sd_json_variant *parameters,
                              sd_varlink_method_flags_t flags, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_free_ uint8_t *ek = NULL, *ek_cert = NULL, *ak = NULL, *ak_name = NULL;
@@ -1441,15 +1656,13 @@ static int vl_get_enrollment(sd_varlink *link, sd_json_variant *parameters,
         size_t ek_len = 0, ek_cert_len = 0, ak_len = 0, ak_name_len = 0;
         int r;
 
-        if (!peer_is_root(link))
-                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         r = attest_get_enrollment(&ek, &ek_len, &ek_cert, &ek_cert_len,
                                   &ak, &ak_len, &ak_name, &ak_name_len);
-        if (r == -ENOTSUP)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
+        if (r == -ENOTSUP || r == -ENODEV)
+                return backend_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
         if (r < 0)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         ek_hex = hex_encode(ek, ek_len);
         ak_hex = hex_encode(ak, ak_len);
@@ -1466,10 +1679,10 @@ static int vl_get_enrollment(sd_varlink *link, sd_json_variant *parameters,
                 SD_JSON_BUILD_PAIR("evidenceQuality", SD_JSON_BUILD_STRING("measured")));
         if (r < 0)
                 return r;
-        return sd_varlink_reply(link, result);
+        return backend_reply(link, result);
 }
 
-static int vl_activate_credential(sd_varlink *link, sd_json_variant *parameters,
+static int vl_activate_credential_run(sd_varlink *link, sd_json_variant *parameters,
                                   sd_varlink_method_flags_t flags, void *userdata) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *result = NULL;
         _cleanup_free_ uint8_t *cred = NULL, *secret = NULL, *challenge = NULL;
@@ -1478,23 +1691,21 @@ static int vl_activate_credential(sd_varlink *link, sd_json_variant *parameters,
         sd_json_variant *pc, *ps;
         int r;
 
-        if (!peer_is_root(link))
-                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
 
         pc = sd_json_variant_by_key(parameters, "credentialHex");
         ps = sd_json_variant_by_key(parameters, "secretHex");
         if (!pc || !sd_json_variant_is_string(pc) ||
             hex_decode(sd_json_variant_string(pc), &cred, &cred_len) < 0)
-                return sd_varlink_error_invalid_parameter_name(link, "credentialHex");
+                return backend_invalid(link, "credentialHex");
         if (!ps || !sd_json_variant_is_string(ps) ||
             hex_decode(sd_json_variant_string(ps), &secret, &secret_len) < 0)
-                return sd_varlink_error_invalid_parameter_name(link, "secretHex");
+                return backend_invalid(link, "secretHex");
 
         r = attest_activate_credential(cred, cred_len, secret, secret_len, &challenge, &challenge_len);
-        if (r == -ENOTSUP)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
+        if (r == -ENOTSUP || r == -ENODEV)
+                return backend_error(link, "io.platformd.Trust.AttestationUnsupported", NULL);
         if (r < 0)
-                return sd_varlink_error(link, "io.platformd.Trust.AttestationFailed", NULL);
+                return backend_error(link, "io.platformd.Trust.AttestationFailed", NULL);
 
         if (!(challenge_hex = hex_encode(challenge, challenge_len)))
                 return -ENOMEM;
@@ -1504,13 +1715,257 @@ static int vl_activate_credential(sd_varlink *link, sd_json_variant *parameters,
         if (r < 0)
                 return r;
         sd_journal_send("MESSAGE=credential activated (AK enrollment)", "PLATFORMD_EVENT=enroll", NULL);
-        return sd_varlink_reply(link, result);
+        return backend_reply(link, result);
+}
+
+typedef struct BackendRequest {
+        struct BackendRequest *next;
+        Worker *worker;
+        sd_varlink *link;
+        sd_json_variant *parameters;
+        sd_varlink_method_t method;
+        RuntimeEvent *event;
+        uint64_t deadline;
+        uid_t peer;
+} BackendRequest;
+
+static int backend_start_next(Manager *m);
+
+static int backend_run(void *userdata, sd_json_variant **ret) {
+        BackendRequest *q = userdata;
+        Manager *m = manager_instance;
+        _cleanup_free_ char *current = NULL;
+        uint8_t value[32];
+        int r;
+
+        if (q->method) {
+                r = q->method(NULL, q->parameters, 0, m);
+                *ret = m->backend_result;
+                m->backend_result = NULL;
+                return r;
+        }
+        r = attest_nv_read(value);
+        if (r < 0)
+                return r;
+        if (q->event) {
+                _cleanup_free_ uint8_t *previous = NULL;
+                const char *expected = m->runtime_tail ? m->runtime_tail->digest : m->baseline_runtime;
+                uint8_t digest[32];
+                EVP_MD_CTX *context;
+                size_t size = 0;
+
+                if (hex_decode(expected, &previous, &size) < 0 || size != 32 ||
+                    memcmp(value, previous, 32) != 0)
+                        return -ESTALE;
+                context = EVP_MD_CTX_new();
+                if (!context)
+                        return -ENOMEM;
+                r = EVP_DigestInit_ex(context, EVP_sha256(), NULL) == 1 &&
+                    EVP_DigestUpdate(context, previous, 32) == 1 &&
+                    EVP_DigestUpdate(context, q->event->desc, strlen(q->event->desc)) == 1 &&
+                    EVP_DigestFinal_ex(context, digest, NULL) == 1;
+                EVP_MD_CTX_free(context);
+                if (!r)
+                        return -EIO;
+                r = attest_nv_extend((const uint8_t *) q->event->desc, strlen(q->event->desc), value);
+                if (r < 0)
+                        return r;
+                if (memcmp(value, digest, sizeof digest) != 0)
+                        return -ESTALE;
+        }
+        current = hex_encode(value, sizeof value);
+        return current ? sd_json_buildo(ret, SD_JSON_BUILD_PAIR_STRING("current", current)) : -ENOMEM;
+}
+
+static void backend_free(BackendRequest *q) {
+        if (!q)
+                return;
+        worker_free(q->worker);
+        sd_varlink_unref(q->link);
+        sd_json_variant_unref(q->parameters);
+        if (q->event) {
+                free(q->event->desc);
+                free(q->event);
+        }
+        free(q);
+}
+
+static void backend_finish(Manager *m, BackendRequest *q, int error, sd_json_variant *result) {
+        if (q->method) {
+                sd_json_variant *name = sd_json_variant_by_key(result, "error");
+                sd_json_variant *parameters = sd_json_variant_by_key(result, "parameters");
+
+                if (q->link) {
+                        if (error < 0)
+                                (void) sd_varlink_error_errno(q->link, error);
+                        else if (sd_json_variant_is_string(name))
+                                (void) sd_varlink_error(q->link, sd_json_variant_string(name), parameters);
+                        else if (parameters)
+                                (void) sd_varlink_reply(q->link, parameters);
+                        else
+                                (void) sd_varlink_error_errno(q->link, -EBADMSG);
+                }
+        } else {
+                sd_json_variant *value = sd_json_variant_by_key(result, "current");
+                const char *current = sd_json_variant_is_string(value) ? sd_json_variant_string(value) : "";
+
+                if (error < 0 || strlen(current) != 64)
+                        m->runtime_log_incomplete = true;
+                else if (q->event) {
+                        RuntimeEvent *e = q->event;
+
+                        q->event = NULL;
+                        memcpy(e->digest, current, sizeof e->digest);
+                        if (m->runtime_tail)
+                                m->runtime_tail->next = e;
+                        else
+                                m->runtime_log = e;
+                        m->runtime_tail = e;
+                        m->n_runtime++;
+                        if (m->n_runtime > RUNTIME_LOG_MAX) {
+                                e = m->runtime_log;
+                                memcpy(m->baseline_runtime, e->digest, sizeof m->baseline_runtime);
+                                m->runtime_log = e->next;
+                                free(e->desc);
+                                free(e);
+                                m->n_runtime--;
+                        }
+                } else
+                        memcpy(m->baseline_runtime, current, sizeof m->baseline_runtime);
+        }
+        m->backend_head = q->next;
+        if (!m->backend_head)
+                m->backend_tail = NULL;
+        backend_free(q);
+}
+
+static void backend_done(int error, sd_json_variant *result, void *userdata) {
+        Manager *m = manager_instance;
+
+        backend_finish(m, userdata, error, result);
+        (void) backend_start_next(m);
+}
+
+static int backend_start_next(Manager *m) {
+        while (m->backend_head && !m->backend_head->worker) {
+                BackendRequest *q = m->backend_head;
+                uint64_t now = now_boottime();
+                int r;
+
+                r = now >= q->deadline ? -ETIMEDOUT :
+                        worker_start(m->event, q->deadline - now, backend_run, backend_done, q, &q->worker);
+                if (r >= 0)
+                        return 0;
+                backend_finish(m, q, r, NULL);
+        }
+        return 0;
+}
+
+static int backend_enqueue(Manager *m, sd_varlink *link, sd_json_variant *parameters,
+                           sd_varlink_method_t method, const char *description) {
+        BackendRequest *q;
+        uid_t peer = (uid_t) -1;
+        unsigned total = 0, owned = 0;
+
+        if (link && sd_varlink_get_peer_uid(link, &peer) < 0)
+                return -EIO;
+        for (q = m->backend_head; q; q = q->next) {
+                total++;
+                owned += q->peer == peer;
+        }
+        if (total >= 64 || (link && owned >= 4))
+                return -EBUSY;
+        q = calloc(1, sizeof *q);
+        if (!q)
+                return -ENOMEM;
+        q->link = sd_varlink_ref(link);
+        q->parameters = sd_json_variant_ref(parameters);
+        q->method = method;
+        q->peer = peer;
+        q->deadline = now_boottime() + 20000000;
+        if (description) {
+                q->event = calloc(1, sizeof *q->event);
+                if (!q->event || !(q->event->desc = strdup(description))) {
+                        backend_free(q);
+                        return -ENOMEM;
+                }
+                q->event->when = now_real();
+        }
+        if (m->backend_tail)
+                m->backend_tail->next = q;
+        else
+                m->backend_head = q;
+        m->backend_tail = q;
+        (void) backend_start_next(m);
+        return 1;
+}
+
+static void runtime_event_queue(Manager *m, const char *description) {
+        if (backend_enqueue(m, NULL, NULL, NULL, description) < 0)
+                m->runtime_log_incomplete = true;
+}
+
+static int backend_request(sd_varlink *link, sd_json_variant *parameters,
+                           sd_varlink_method_t method, bool privileged) {
+        if (privileged && !peer_is_root(link))
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
+        return backend_enqueue(manager_instance, link, parameters, method, NULL);
+}
+
+static void on_disconnect(sd_varlink_server *server, sd_varlink *link, void *userdata) {
+        Manager *m = userdata;
+
+        for (IdentityRequest **p = &m->identity_requests; *p;) {
+                IdentityRequest *q = *p;
+
+                if (q->link != link) {
+                        p = &q->next;
+                        continue;
+                }
+                *p = q->next;
+                identity_free(q);
+        }
+        for (BackendRequest *q = m->backend_head; q; q = q->next)
+                if (q->link == link) {
+                        q->link = sd_varlink_unref(q->link);
+                        q->deadline = 0;
+                }
+}
+
+static int vl_get_runtime_log(sd_varlink *link, sd_json_variant *parameters,
+                       sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_get_runtime_log_run, false);
+}
+
+static int vl_get_measured_boot(sd_varlink *link, sd_json_variant *parameters,
+                               sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_get_measured_boot_run, false);
+}
+
+static int vl_attest(sd_varlink *link, sd_json_variant *parameters,
+                       sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_attest_run, true);
+}
+
+static int vl_get_attestation_token(sd_varlink *link, sd_json_variant *parameters,
+                       sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_get_attestation_token_run, true);
+}
+
+static int vl_get_enrollment(sd_varlink *link, sd_json_variant *parameters,
+                       sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_get_enrollment_run, true);
+}
+
+static int vl_activate_credential(sd_varlink *link, sd_json_variant *parameters,
+                       sd_varlink_method_flags_t flags, void *userdata) {
+        return backend_request(link, parameters, vl_activate_credential_run, true);
 }
 
 /* --- Varlink server ---------------------------------------------------------- */
 
 static int setup_varlink(Manager *m) {
-        _cleanup_free_ char *addr = NULL;
+        _cleanup_free_ char *addr = NULL, *lock = NULL;
         const char *dir;
         int r;
 
@@ -1520,12 +1975,24 @@ static int setup_varlink(Manager *m) {
         if (!dir || !*dir)
                 dir = "/run/platformd-trustd";
         (void) mkdir(dir, 0755);
+        if (asprintf(&lock, "%s/lock", dir) < 0)
+                return -ENOMEM;
+        m->listener_lock = open(lock, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+        if (m->listener_lock < 0 || flock(m->listener_lock, LOCK_EX | LOCK_NB) < 0)
+                return -errno;
         if (asprintf(&addr, "%s/io.platformd.Trust", dir) < 0)
                 return -ENOMEM;
 
         if ((r = sd_varlink_server_new(&m->varlink, 0)) < 0)
                 return r;
         (void) sd_varlink_server_set_description(m->varlink, "platformd-trustd");
+        sd_varlink_server_set_userdata(m->varlink, m);
+        if ((r = sd_varlink_server_bind_disconnect(m->varlink, on_disconnect)) < 0)
+                return r;
+        if ((r = sd_varlink_server_add_interface(m->varlink, &vl_interface_io_platformd_Trust)) < 0 ||
+            (r = sd_varlink_server_set_info(m->varlink, "platformd", "platformd-trustd", PROGRAM_VERSION,
+                                           "https://github.com/CoastLineSec/platformd-trustd")) < 0)
+                return r;
         if ((r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.GetBootEvidence", vl_get_boot_evidence)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.GetMeasuredBoot", vl_get_measured_boot)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.ListSessions", vl_list_sessions)) < 0 ||
@@ -1549,12 +2016,34 @@ static int setup_varlink(Manager *m) {
         return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
         _cleanup_(sd_event_unrefp) sd_event *event = NULL;
-        Manager manager = { .fresh_window = 300 };
+        Manager manager = { .fresh_window = 300, .listener_lock = -1 };
         const char *fw;
         sigset_t ss;
         int r;
+
+        if (argc == 2 && (streq(argv[1], "--help") || streq(argv[1], "-h"))) {
+                puts("platformd-trustd [OPTIONS...]\n\nObserve platform authentication state.\n\n"
+                     "  -h --help                    Show this help\n"
+                     "     --version                 Show package version\n"
+                     "     --initialize-runtime-log  Initialize the TPM runtime-log index");
+                return EXIT_SUCCESS;
+        }
+        if (argc == 2 && streq(argv[1], "--version")) {
+                puts("platformd-trustd " PROGRAM_VERSION);
+                return EXIT_SUCCESS;
+        }
+        if (argc == 2 && streq(argv[1], "--initialize-runtime-log")) {
+                r = geteuid() == 0 ? attest_nv_initialize() : -EPERM;
+                if (r < 0)
+                        fprintf(stderr, "Failed to initialize runtime log: %s\n", strerror(-r));
+                return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        }
+        if (argc != 1) {
+                fprintf(stderr, "Unexpected argument: %s\n", argv[1]);
+                return EXIT_FAILURE;
+        }
 
         if ((r = sd_event_default(&event)) < 0) {
                 sd_journal_print(LOG_ERR, "sd_event_default: %s", strerror(-r));
@@ -1564,30 +2053,36 @@ int main(void) {
         manager_instance = &manager;
 
         fw = getenv("PLATFORMD_TRUST_FRESH_WINDOW_SEC");
-        if (fw && *fw)
-                manager.fresh_window = strtoull(fw, NULL, 10);
+        if (fw && *fw) {
+                char *end;
+                unsigned long long window;
 
-        /* Record the NV log value before we extend it, so a verifier can replay
-         * baseline + the runtime events up to the certified NV value. */
-        {
-                uint8_t value[32];
-                if (attest_nv_read(value) == 0)
-                        for (int i = 0; i < 32; i++)
-                                snprintf(manager.baseline_runtime + 2 * i, 3, "%02x", value[i]);
+                errno = 0;
+                window = strtoull(fw, &end, 10);
+                if (errno != 0 || fw[0] < '0' || fw[0] > '9' || *end || window == 0 || window > 86400) {
+                        sd_journal_print(LOG_ERR, "Invalid authentication freshness window: %s", fw);
+                        return EXIT_FAILURE;
+                }
+                manager.fresh_window = window;
         }
 
         sigemptyset(&ss);
         sigaddset(&ss, SIGTERM);
         sigaddset(&ss, SIGINT);
+        sigaddset(&ss, SIGCHLD);
         sigprocmask(SIG_BLOCK, &ss, NULL);
         (void) sd_event_add_signal(event, NULL, SIGTERM, NULL, NULL);
         (void) sd_event_add_signal(event, NULL, SIGINT, NULL, NULL);
 
-        setup_logind(&manager);   /* best-effort */
         if ((r = setup_varlink(&manager)) < 0) {
                 sd_journal_print(LOG_ERR, "setup_varlink: %s", strerror(-r));
+                sd_varlink_server_unref(manager.varlink);
+                if (manager.listener_lock >= 0)
+                        close(manager.listener_lock);
                 return EXIT_FAILURE;
         }
+        runtime_event_queue(&manager, NULL);
+        setup_logind(&manager);
 
         sd_notify(false, "READY=1\n"
                          "STATUS=platformd-trustd: observing platform-authentication state");
@@ -1595,13 +2090,18 @@ int main(void) {
 
         r = sd_event_loop(event);
 
-        while (manager.sessions) {
-                TrackedSession *s = manager.sessions;
-                manager.sessions = s->next;
-                free(s->id);
-                free(s->path);
-                free(s);
+        while (manager.backend_head) {
+                BackendRequest *q = manager.backend_head;
+                manager.backend_head = q->next;
+                backend_free(q);
         }
+        while (manager.identity_requests) {
+                IdentityRequest *q = manager.identity_requests;
+                manager.identity_requests = q->next;
+                identity_free(q);
+        }
+        forget_sessions(&manager);
+        sd_event_source_unref(manager.reconnect);
         while (manager.events) {
                 AuthEvent *e = manager.events;
                 manager.events = e->next;
@@ -1614,5 +2114,8 @@ int main(void) {
                 free(e);
         }
         sd_bus_flush_close_unref(manager.bus);
-        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
+        sd_varlink_server_unref(manager.varlink);
+        if (manager.listener_lock >= 0)
+                close(manager.listener_lock);
+        return r != 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }

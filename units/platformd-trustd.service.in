@@ -1,9 +1,12 @@
 [Unit]
 Description=platformd platform-authentication state authority
 Documentation=man:platformd-trustd.service(8)
+After=dbus.service systemd-logind.service
 
 [Service]
 Type=notify
+Restart=on-failure
+RestartSec=5s
 ExecStart=@LIBEXECDIR@/platformd-trustd
 RuntimeDirectory=platformd-trustd
 RuntimeDirectoryMode=0755

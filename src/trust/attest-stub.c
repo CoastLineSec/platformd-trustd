@@ -2,8 +2,17 @@
 /* Built when the tss2 libraries are absent: attestation is unsupported. */
 
 #include "attest.h"
-
 #include <errno.h>
+
+int attest_nv_initialize(void) {
+        return -ENOTSUP;
+}
+
+int attest_nv_public(uint8_t **ret, size_t *ret_size) {
+        *ret = NULL;
+        *ret_size = 0;
+        return -ENOTSUP;
+}
 
 int attest_quote(const uint8_t *nonce, size_t nonce_len,
                  uint8_t **ak_pub, size_t *ak_pub_len,

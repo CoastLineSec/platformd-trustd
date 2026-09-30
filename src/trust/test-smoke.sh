@@ -14,6 +14,12 @@ SOCK="$PLATFORMD_TRUSTD_RUNTIME/io.platformd.Trust"
 PLATFORMD_TRUST_SOCKET="$SOCK"
 export PLATFORMD_TRUSTD_RUNTIME PLATFORMD_TRUST_SOCKET
 
+timeout 1 "$TRUSTD" --help | grep -q platformd-trustd
+timeout 1 "$TRUSTD" --version | grep -q platformd-trustd
+if timeout 1 "$TRUSTD" --invalid-option >/dev/null 2>&1; then
+        exit 1
+fi
+[ ! -e "$SOCK" ]
 "$TRUSTD" >/dev/null 2>&1 &
 PID=$!
 cleanup() {
@@ -31,6 +37,24 @@ while [ ! -S "$SOCK" ] && [ "$i" -lt 100 ]; do
         sleep 0.05
 done
 [ -S "$SOCK" ] || { echo "FAIL: Varlink socket was not created"; exit 1; }
+varlinkctl info "$SOCK" | grep -q platformd-trustd
+normalize_idl() {
+        awk '
+                { sub(/#.*/, "") }
+                /^[[:space:]]*(interface|type|method|error)[[:space:]]/ { if (s != "") print s; s = "" }
+                { gsub(/[[:space:]]/, ""); s = s $0 }
+                END { if (s != "") print s }
+        ' | sort
+}
+published=$(varlinkctl introspect "$SOCK" io.platformd.Trust | normalize_idl)
+expected=$(normalize_idl < "$(dirname "$0")/io.platformd.Trust.varlink")
+[ "$published" = "$expected" ]
+inode=$(stat -c %i "$SOCK")
+if "$TRUSTD" >/dev/null 2>&1; then
+        echo 'FAIL: duplicate daemon accepted'
+        exit 1
+fi
+[ "$(stat -c %i "$SOCK")" = "$inode" ]
 
 OUT="$("$TRUSTCTL" status 2>&1)" || { echo "FAIL: trustctl status errored"; echo "$OUT"; exit 1; }
 echo "$OUT"

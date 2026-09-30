@@ -3,6 +3,7 @@
 #include "attest.h"
 
 #include <errno.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -23,7 +24,7 @@ static int esys_initialize(ESYS_CONTEXT **ret, TSS2_TCTI_CONTEXT **ret_tcti) {
                 else if (access("/dev/tpm0", R_OK | W_OK) == 0)
                         tcti_conf = "device:/dev/tpm0";
                 else
-                        return -EACCES;
+                        return -ENODEV;
         }
 
         if (Tss2_TctiLdr_Initialize(tcti_conf, &tcti) != TSS2_RC_SUCCESS) {
@@ -35,6 +36,11 @@ static int esys_initialize(ESYS_CONTEXT **ret, TSS2_TCTI_CONTEXT **ret_tcti) {
                         Esys_Finalize(&context);
                 Tss2_TctiLdr_Finalize(&tcti);
                 return -EACCES;
+        }
+        if (Esys_SetTimeout(context, 2000) != TSS2_RC_SUCCESS) {
+                Esys_Finalize(&context);
+                Tss2_TctiLdr_Finalize(&tcti);
+                return -EIO;
         }
 
         *ret = context;
@@ -153,8 +159,9 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
                 return -EINVAL;
         memcpy(qualifying.buffer, nonce, nonce_len);
 
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;   /* no TPM device / resource manager reachable */
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
 
         if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0)
                 goto out;
@@ -192,13 +199,9 @@ out:
 
 #define TRUSTD_NV_INDEX 0x01800001u
 
-/* Ensure trustd's extend-only NV index exists (define it if absent). It is a
- * PCR-like extend index that clears on reboot (STCLEAR). Unlike an
- * application PCR, it cannot be reset at locality 0, so the runtime auth log is
- * append-only within a boot. */
-static int nv_ensure(ESYS_CONTEXT *ctx, ESYS_TR *nv) {
+static int nv_open(ESYS_CONTEXT *ctx, ESYS_TR *nv, bool initialize) {
         static const TPM2B_AUTH empty = { .size = 0 };
-        TPM2B_NV_PUBLIC pub = {
+        static const TPM2B_NV_PUBLIC expected = {
                 .nvPublic = {
                         .nvIndex = TRUSTD_NV_INDEX,
                         .nameAlg = TPM2_ALG_SHA256,
@@ -209,13 +212,75 @@ static int nv_ensure(ESYS_CONTEXT *ctx, ESYS_TR *nv) {
                         .dataSize = 32,
                 },
         };
+        TPM2B_NV_PUBLIC *public = NULL;
+        TSS2_RC rc;
+        int r = -EIO;
 
-        if (Esys_TR_FromTPMPublic(ctx, TRUSTD_NV_INDEX, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, nv) == TSS2_RC_SUCCESS)
-                return 0;   /* already defined */
-        if (Esys_NV_DefineSpace(ctx, ESYS_TR_RH_OWNER, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                                &empty, &pub, nv) != TSS2_RC_SUCCESS)
+        rc = Esys_TR_FromTPMPublic(ctx, TRUSTD_NV_INDEX, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, nv);
+        if (rc != TSS2_RC_SUCCESS) {
+                if ((rc & 0xffffU & ~TPM2_RC_N_MASK) != TPM2_RC_HANDLE)
+                        return -EIO;
+                if (!initialize)
+                        return -ENOENT;
+                if (Esys_NV_DefineSpace(ctx, ESYS_TR_RH_OWNER, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                                       &empty, &expected, nv) != TSS2_RC_SUCCESS)
+                        return -EIO;
+        }
+        if (Esys_NV_ReadPublic(ctx, *nv, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &public, NULL) != TSS2_RC_SUCCESS)
                 return -EIO;
-        return 0;
+        if (public && public->nvPublic.nvIndex == TRUSTD_NV_INDEX &&
+            public->nvPublic.nameAlg == expected.nvPublic.nameAlg &&
+            public->nvPublic.dataSize == expected.nvPublic.dataSize &&
+            public->nvPublic.authPolicy.size == 0 &&
+            (public->nvPublic.attributes & ~TPMA_NV_WRITTEN) == expected.nvPublic.attributes)
+                r = 0;
+        else
+                r = -EKEYREJECTED;
+        Esys_Free(public);
+        return r;
+}
+
+int attest_nv_initialize(void) {
+        ESYS_CONTEXT *context = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
+        ESYS_TR nv = ESYS_TR_NONE;
+        int r;
+
+        r = esys_initialize(&context, &tcti);
+        if (r < 0)
+                return r;
+        r = nv_open(context, &nv, true);
+        esys_finalize(&context, &tcti);
+        return r;
+}
+
+int attest_nv_public(uint8_t **ret, size_t *ret_size) {
+        ESYS_CONTEXT *context = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
+        ESYS_TR nv = ESYS_TR_NONE;
+        TPM2B_NV_PUBLIC *public = NULL;
+        uint8_t buffer[sizeof(TPM2B_NV_PUBLIC)];
+        size_t offset = 0;
+        int r;
+
+        *ret = NULL;
+        *ret_size = 0;
+        r = esys_initialize(&context, &tcti);
+        if (r < 0)
+                return r;
+        r = nv_open(context, &nv, false);
+        if (r < 0)
+                goto finish;
+        r = -EIO;
+        if (Esys_NV_ReadPublic(context, nv, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                              &public, NULL) != TSS2_RC_SUCCESS ||
+            Tss2_MU_TPM2B_NV_PUBLIC_Marshal(public, buffer, sizeof buffer, &offset) != TSS2_RC_SUCCESS)
+                goto finish;
+        r = dup_bytes(buffer, offset, ret, ret_size);
+finish:
+        Esys_Free(public);
+        esys_finalize(&context, &tcti);
+        return r;
 }
 
 int attest_nv_read(uint8_t value_out[32]) {
@@ -223,18 +288,24 @@ int attest_nv_read(uint8_t value_out[32]) {
         TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR nv = ESYS_TR_NONE;
         TPM2B_MAX_NV_BUFFER *data = NULL;
+        TSS2_RC rc;
         int r = -EIO;
 
         memset(value_out, 0, 32);
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;
-        if (nv_ensure(ctx, &nv) < 0)
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
+        if ((r = nv_open(ctx, &nv, false)) < 0)
                 goto out;
-        /* Before the first extend the index is unwritten and reads as all zeroes. */
-        if (Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                         32, 0, &data) == TSS2_RC_SUCCESS && data->size == 32)
+        rc = Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                          32, 0, &data);
+        if (rc == TSS2_RC_SUCCESS && data && data->size == 32) {
                 memcpy(value_out, data->buffer, 32);
-        r = 0;
+                r = 0;
+        } else if (rc == TPM2_RC_NV_UNINITIALIZED)
+                r = 0;
+        else
+                r = -EIO;
 out:
         Esys_Free(data);
         esys_finalize(&ctx, &tcti);
@@ -253,15 +324,18 @@ int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]) {
                 return -EINVAL;
         in.size = (uint16_t) len;
         memcpy(in.buffer, data, len);
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;
-        if (nv_ensure(ctx, &nv) < 0)
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
+        if ((r = nv_open(ctx, &nv, false)) < 0)
                 goto out;
+        r = -EIO;
         if (Esys_NV_Extend(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &in) != TSS2_RC_SUCCESS)
                 goto out;
         if (Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                         32, 0, &out) == TSS2_RC_SUCCESS && out->size == 32)
-                memcpy(value_out, out->buffer, 32);
+                         32, 0, &out) != TSS2_RC_SUCCESS || !out || out->size != 32)
+                goto out;
+        memcpy(value_out, out->buffer, 32);
         r = 0;
 out:
         Esys_Free(out);
@@ -289,10 +363,13 @@ int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
         if (nonce_len == 0 || nonce_len > sizeof qualifying.buffer)
                 return -EINVAL;
         memcpy(qualifying.buffer, nonce, nonce_len);
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;
-        if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0 ||
-            nv_ensure(ctx, &nv) < 0)
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
+        if ((r = nv_open(ctx, &nv, false)) < 0)
+                goto out;
+        r = -EIO;
+        if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0)
                 goto out;
         if (Esys_NV_Certify(ctx, ak, ESYS_TR_RH_OWNER, nv,
                             ESYS_TR_PASSWORD, ESYS_TR_PASSWORD, ESYS_TR_NONE,
@@ -324,13 +401,72 @@ out:
         return r;
 }
 
+static int read_ek_certificate(ESYS_CONTEXT *ctx, uint8_t **ret, size_t *ret_size) {
+        ESYS_TR nv = ESYS_TR_NONE;
+        TPM2B_NV_PUBLIC *public = NULL;
+        TPMS_CAPABILITY_DATA *capabilities = NULL;
+        TPMI_YES_NO more;
+        uint8_t *buffer = NULL;
+        size_t limit, size;
+        TSS2_RC rc;
+        int r = -EIO;
+
+        rc = Esys_TR_FromTPMPublic(ctx, 0x01C0000A, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nv);
+        if (rc != TSS2_RC_SUCCESS)
+                return (rc & 0xffffU & ~TPM2_RC_N_MASK) == TPM2_RC_HANDLE ? 0 : -EIO;
+        if (Esys_NV_ReadPublic(ctx, nv, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &public, NULL) != TSS2_RC_SUCCESS ||
+            Esys_GetCapability(ctx, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                               TPM2_CAP_TPM_PROPERTIES, TPM2_PT_NV_BUFFER_MAX, 1, &more, &capabilities) != TSS2_RC_SUCCESS ||
+            !public || !capabilities || capabilities->capability != TPM2_CAP_TPM_PROPERTIES ||
+            capabilities->data.tpmProperties.count != 1 ||
+            capabilities->data.tpmProperties.tpmProperty[0].property != TPM2_PT_NV_BUFFER_MAX)
+                goto finish;
+        limit = capabilities->data.tpmProperties.tpmProperty[0].value;
+        if (limit > sizeof(((TPM2B_MAX_NV_BUFFER *) 0)->buffer))
+                limit = sizeof(((TPM2B_MAX_NV_BUFFER *) 0)->buffer);
+        size = public->nvPublic.dataSize;
+        if (limit == 0 || size == 0)
+                goto finish;
+        buffer = malloc(size);
+        if (!buffer) {
+                r = -ENOMEM;
+                goto finish;
+        }
+        for (size_t offset = 0; offset < size;) {
+                TPM2B_MAX_NV_BUFFER *data = NULL;
+                size_t chunk = size - offset < limit ? size - offset : limit;
+                ESYS_TR auth = public->nvPublic.attributes & TPMA_NV_OWNERREAD ? ESYS_TR_RH_OWNER : nv;
+
+                rc = Esys_NV_Read(ctx, auth, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                                  (UINT16) chunk, (UINT16) offset, &data);
+                if (rc != TSS2_RC_SUCCESS || !data || data->size != chunk) {
+                        Esys_Free(data);
+                        goto finish;
+                }
+                memcpy(buffer + offset, data->buffer, chunk);
+                offset += chunk;
+                Esys_Free(data);
+        }
+        *ret = buffer;
+        *ret_size = size;
+        buffer = NULL;
+        r = 0;
+finish:
+        free(buffer);
+        Esys_Free(public);
+        Esys_Free(capabilities);
+        if (nv != ESYS_TR_NONE)
+                Esys_TR_Close(ctx, &nv);
+        return r;
+}
+
 int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                           uint8_t **ek_cert, size_t *ek_cert_len,
                           uint8_t **ak_pub, size_t *ak_pub_len,
                           uint8_t **ak_name, size_t *ak_name_len) {
         ESYS_CONTEXT *ctx = NULL;
         TSS2_TCTI_CONTEXT *tcti = NULL;
-        ESYS_TR ek = ESYS_TR_NONE, ak = ESYS_TR_NONE, nv = ESYS_TR_NONE;
+        ESYS_TR ek = ESYS_TR_NONE, ak = ESYS_TR_NONE;
         TPM2B_PUBLIC *ekp = NULL, *akp = NULL;
         TPM2B_NAME *akn = NULL;
         uint8_t ek_buf[sizeof(TPM2B_PUBLIC)], ak_buf[sizeof(TPM2B_PUBLIC)];
@@ -340,8 +476,9 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
         *ek_pub = *ek_cert = *ak_pub = *ak_name = NULL;
         *ek_pub_len = *ek_cert_len = *ak_pub_len = *ak_name_len = 0;
 
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
         if (create_primary(ctx, ESYS_TR_RH_ENDORSEMENT, &ek_template, &ek, &ekp, NULL) < 0 ||
             create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &akp, &akn) < 0)
                 goto out;
@@ -355,23 +492,7 @@ int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                 goto out;
         }
 
-        /* The EK certificate from NV is optional because many
-         * firmware TPMs ship without one; the activation proof works regardless. */
-        if (Esys_TR_FromTPMPublic(ctx, 0x01C0000A, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nv) == TSS2_RC_SUCCESS) {
-                TPM2B_NV_PUBLIC *nvpub = NULL;
-                if (Esys_NV_ReadPublic(ctx, nv, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE, &nvpub, NULL) == TSS2_RC_SUCCESS) {
-                        UINT16 sz = nvpub->nvPublic.dataSize;
-                        TPM2B_MAX_NV_BUFFER *data = NULL;
-                        if (sz > 0 && Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv,
-                                                   ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
-                                                   sz, 0, &data) == TSS2_RC_SUCCESS) {
-                                (void) dup_bytes(data->buffer, data->size, ek_cert, ek_cert_len);
-                                Esys_Free(data);
-                        }
-                        Esys_Free(nvpub);
-                }
-        }
-        r = 0;
+        r = read_ek_certificate(ctx, ek_cert, ek_cert_len);
 out:
         Esys_Free(ekp);
         Esys_Free(akp);
@@ -383,9 +504,11 @@ out:
         esys_finalize(&ctx, &tcti);
         if (r < 0) {
                 free(*ek_pub);
+                free(*ek_cert);
                 free(*ak_pub);
                 free(*ak_name);
-                *ek_pub = *ak_pub = *ak_name = NULL;
+                *ek_pub = *ek_cert = *ak_pub = *ak_name = NULL;
+                *ek_pub_len = *ek_cert_len = *ak_pub_len = *ak_name_len = 0;
         }
         return r;
 }
@@ -412,8 +535,9 @@ int attest_activate_credential(const uint8_t *cred, size_t cred_len,
         if (Tss2_MU_TPM2B_ENCRYPTED_SECRET_Unmarshal(secret, secret_len, &off, &enc_secret) != TSS2_RC_SUCCESS)
                 return -EINVAL;
 
-        if (esys_initialize(&ctx, &tcti) < 0)
-                return -EACCES;
+        if ((r = esys_initialize(&ctx, &tcti)) < 0)
+                return r;
+        r = -EIO;
         if (create_primary(ctx, ESYS_TR_RH_ENDORSEMENT, &ek_template, &ek, &ekp, NULL) < 0 ||
             create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &akp, NULL) < 0)
                 goto out;

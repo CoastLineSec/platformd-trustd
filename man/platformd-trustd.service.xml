@@ -58,8 +58,8 @@
     <para>Session lock state is read from the logind
     <varname>LockedHint</varname> property. It is reported as
     <literal>locked</literal>, <literal>unlocked</literal>, or
-    <literal>unknown</literal>. Lock state changes do not establish or clear
-    verification freshness.</para>
+    <literal>unknown</literal>. Locking or losing authoritative lock state
+    clears verification freshness. Unlocking does not establish it.</para>
 
     <para>New sessions have no verification timestamp. Session creation and
     unlock notifications do not establish freshness. Freshness is established
@@ -127,7 +127,9 @@
     <para>When TPM support is available, <function>Attest</function> returns a
     nonce-bound quote over the boot PCRs. Runtime events are extended into a TPM
     NV index. <function>GetAttestationToken</function> combines the quote, boot
-    measurements, and runtime log in the JSON Entity Attestation Token profile.
+    measurements, and runtime log in a platformd-specific JSON envelope. The
+    outer JSON is unsigned; only the embedded TPM structures are signed. This
+    format is not an IETF Entity Attestation Token.
     <function>GetEnrollment</function> and
     <function>ActivateCredential</function> support binding the attestation key
     to the TPM.</para>
@@ -135,6 +137,11 @@
     <para>Authentication events are declared evidence. TPM measurement protects
     the recorded sequence from undetected modification after collection, but
     does not verify a declared authentication method.</para>
+
+    <para>The runtime-log NV index must be initialized explicitly with
+    <command>platformd-trustd --initialize-runtime-log</command>. The command
+    requires user ID 0 and rejects conflicting index definitions. Reads never
+    create an index. Restart the service after initialization.</para>
   </refsect1>
 
   <refsect1>

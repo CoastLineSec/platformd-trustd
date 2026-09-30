@@ -8,58 +8,59 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 
-#define _cleanup_(f) __attribute__((cleanup(f)))
-static inline void freep(void *p) { free(*(void **) p); }
-#define _cleanup_free_ _cleanup_(freep)
+const char *user_record_signing_key(sd_json_variant *record) {
+        static char *exclude[] = { "binding", "status", "signature", "secret", NULL };
+        sd_json_variant *signable = NULL, *signatures;
+        char *text = NULL;
+        const char *verified_key = NULL;
 
-bool user_record_verify(sd_json_variant *record) {
-        static char *exclude[] = {
-                (char *) "binding", (char *) "status", (char *) "signature", (char *) "secret", NULL,
-        };
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *signable = NULL;
-        _cleanup_free_ char *text = NULL;
-        _cleanup_free_ void *sig = NULL;
-        sd_json_variant *sigarr, *sig0, *data, *key;
-        EVP_PKEY *pkey = NULL;
-        EVP_MD_CTX *ctx = NULL;
-        size_t sig_len = 0;
-        bool ok = false;
-        BIO *bio;
+        signatures = sd_json_variant_by_key(record, "signature");
+        if (!sd_json_variant_is_array(signatures) || sd_json_variant_elements(signatures) > 64)
+                return NULL;
 
-        sigarr = sd_json_variant_by_key(record, "signature");
-        sig0 = sigarr && sd_json_variant_is_array(sigarr) && sd_json_variant_elements(sigarr) > 0
-                ? sd_json_variant_by_index(sigarr, 0) : NULL;
-        if (!sig0)
-                return false;
-        data = sd_json_variant_by_key(sig0, "data");
-        key = sd_json_variant_by_key(sig0, "key");
-        if (!data || !sd_json_variant_is_string(data) || !key || !sd_json_variant_is_string(key))
-                return false;
-        if (sd_json_variant_unbase64(data, &sig, &sig_len) < 0 || sig_len != 64)
-                return false;   /* not an Ed25519 signature */
-
-        /* The signed form: the record without the non-signable sections, key-sorted
-         * (normalize) and compact. This is the normalization homed signs. */
         signable = sd_json_variant_ref(record);
         if (sd_json_variant_filter(&signable, exclude) < 0 ||
             sd_json_variant_normalize(&signable) < 0 ||
             sd_json_variant_format(signable, 0, &text) < 0)
-                return false;
+                goto finish;
 
-        bio = BIO_new_mem_buf(sd_json_variant_string(key), -1);
-        if (!bio)
-                return false;
-        pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
-        BIO_free(bio);
-        if (!pkey)
-                return false;
+        for (size_t i = 0; i < sd_json_variant_elements(signatures); i++) {
+                sd_json_variant *signature = sd_json_variant_by_index(signatures, i);
+                sd_json_variant *data = sd_json_variant_by_key(signature, "data");
+                sd_json_variant *key = sd_json_variant_by_key(signature, "key");
+                EVP_PKEY *pkey = NULL;
+                EVP_MD_CTX *context = NULL;
+                void *bytes = NULL;
+                size_t size = 0;
+                BIO *bio;
 
-        ctx = EVP_MD_CTX_new();
-        if (ctx &&
-            EVP_DigestVerifyInit(ctx, NULL, NULL, NULL, pkey) == 1 &&
-            EVP_DigestVerify(ctx, sig, sig_len, (const unsigned char *) text, strlen(text)) == 1)
-                ok = true;
-        EVP_MD_CTX_free(ctx);
-        EVP_PKEY_free(pkey);
-        return ok;
+                if (!sd_json_variant_is_string(data) || !sd_json_variant_is_string(key))
+                        continue;
+                if (sd_json_variant_unbase64(data, &bytes, &size) < 0)
+                        continue;
+                bio = BIO_new_mem_buf(sd_json_variant_string(key), -1);
+                if (bio) {
+                        pkey = PEM_read_bio_PUBKEY(bio, NULL, NULL, NULL);
+                        BIO_free(bio);
+                }
+                context = EVP_MD_CTX_new();
+                if (size == 64 && pkey && EVP_PKEY_is_a(pkey, "ED25519") && context &&
+                    EVP_DigestVerifyInit(context, NULL, NULL, NULL, pkey) == 1 &&
+                    EVP_DigestVerify(context, bytes, size, (const unsigned char *) text, strlen(text)) == 1)
+                        verified_key = sd_json_variant_string(key);
+                EVP_MD_CTX_free(context);
+                EVP_PKEY_free(pkey);
+                free(bytes);
+                if (verified_key)
+                        break;
+        }
+
+finish:
+        free(text);
+        sd_json_variant_unref(signable);
+        return verified_key;
+}
+
+bool user_record_verify(sd_json_variant *record) {
+        return user_record_signing_key(record) != NULL;
 }

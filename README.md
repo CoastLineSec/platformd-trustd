@@ -18,7 +18,7 @@ The service does not authenticate users, store credentials, or grant access.
 
 The build requires libsystemd 257 or newer, OpenSSL 3.0 or newer, Meson 1.1 or
 newer, Ninja, and a C11 compiler. TPM attestation additionally requires
-tss2-esys and tss2-mu. The PAM module requires libpam. Boot reference
+tss2-esys, tss2-mu, and tss2-tctildr. The PAM module requires libpam. Boot reference
 provisioning requires `systemd-measure`.
 
 ## Building
@@ -29,6 +29,9 @@ meson compile -C build
 meson test -C build
 sudo meson install -C build
 ```
+
+`-Dpammoduledir=PATH` selects the PAM module directory. The default is taken
+from `pam.pc`, with `${libdir}/security` as the fallback.
 
 ## Usage
 
@@ -49,6 +52,9 @@ establish freshness.
 Attestation is unavailable when the package is built without TPM2-TSS or the
 system has no usable TPM. Authentication events remain declared evidence even
 when they are included in a TPM protected runtime measurement log.
+
+The runtime log requires explicit NV index initialization. Attestation uses a
+platformd-specific JSON envelope, not an IETF Entity Attestation Token.
 
 See [Platform Trust](docs/platform-trust.md),
 `platformd-trustd.service(8)`, `trustctl(1)`, and `pam_platformd(8)`.

@@ -1,19 +1,20 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 /* PAM interface for session records and trust policy evaluation. */
 
+#include <errno.h>
 #include <pwd.h>
-#include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/time.h>
-#include <sys/un.h>
 
 #include <security/pam_ext.h>
 #include <security/pam_modules.h>
+#include <security/pam_modutil.h>
 
 #include <systemd/sd-json.h>
+#include <systemd/sd-login.h>
+
+#include "pam-transport.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -39,116 +40,138 @@ static const char *item(pam_handle_t *pamh, int type) {
         return pam_get_item(pamh, type, &v) == PAM_SUCCESS && v ? (const char *) v : "";
 }
 
-/* sd_varlink_call() cannot be used from every process that loads a PAM module. */
-static sd_json_variant *trustd_call(const char *method, sd_json_variant *params) {
-        _cleanup_(sd_json_variant_unrefp) sd_json_variant *envelope = NULL;
-        _cleanup_free_ char *text = NULL, *buf = NULL;
-        struct sockaddr_un sa = { .sun_family = AF_UNIX };
-        struct timeval tv = { .tv_sec = 5 };
-        const char *sock = getenv("PLATFORMD_TRUST_SOCKET");
-        const char *dir = getenv("PLATFORMD_TRUSTD_RUNTIME");
-        sd_json_variant *reply = NULL;
-        size_t buflen = 0, cap = 0, tlen;
-        int fd, len;
+static int session_subject(pam_handle_t *pamh, char **ret_session, uid_t *ret_uid) {
+        _cleanup_free_ char *sid = NULL;
+        const char *user = item(pamh, PAM_USER);
+        struct passwd *pw;
+        uid_t owner;
+        int r;
 
-        /* Accept an explicit socket path or runtime directory. */
-        if (sock && *sock)
-                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s", sock);
-        else
-                len = snprintf(sa.sun_path, sizeof sa.sun_path, "%s/io.platformd.Trust",
-                               dir && *dir ? dir : "/run/platformd-trustd");
-        if (len < 0 || (size_t) len >= sizeof sa.sun_path)
-                return NULL;
-        if (sd_json_buildo(&envelope,
-                SD_JSON_BUILD_PAIR("method", SD_JSON_BUILD_STRING(method)),
-                SD_JSON_BUILD_PAIR("parameters", SD_JSON_BUILD_VARIANT(params))) < 0)
-                return NULL;
-        if (sd_json_variant_format(envelope, 0, &text) < 0)
+        *ret_session = NULL;
+        if (!*user)
+                return -ENODATA;
+        pw = pam_modutil_getpwnam(pamh, user);
+        if (!pw)
+                return -ESRCH;
+
+        r = sd_pid_get_session(0, &sid);
+        if (r < 0)
+                return r;
+        if (!sid || !*sid)
+                return -ENODATA;
+        r = sd_session_get_uid(sid, &owner);
+        if (r < 0)
+                return r;
+
+        /* A caller's session cannot establish policy for another PAM account. */
+        if (owner != pw->pw_uid)
+                return -EPERM;
+
+        if (ret_uid)
+                *ret_uid = owner;
+        *ret_session = sid;
+        sid = NULL;
+        return 0;
+}
+
+static sd_json_variant *json_field(sd_json_variant *object, const char *name) {
+        sd_json_variant *field = NULL;
+
+        if (!sd_json_variant_is_object(object))
                 return NULL;
 
-        if ((fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0)) < 0)
-                return NULL;
-        (void) setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
-        (void) setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
-        if (connect(fd, (struct sockaddr *) &sa, sizeof sa) < 0) {
-                close(fd);
-                return NULL;
-        }
-        tlen = strlen(text);
-        if (write(fd, text, tlen + 1) != (ssize_t) (tlen + 1)) {
-                close(fd);
-                return NULL;
-        }
-        for (;;) {
-                char chunk[1024];
-                ssize_t n = read(fd, chunk, sizeof chunk);
-                char *nb;
+        for (size_t i = 0; i < sd_json_variant_elements(object); i += 2) {
+                sd_json_variant *key = sd_json_variant_by_index(object, i);
 
-                if (n <= 0)
-                        break;
-                if (buflen + (size_t) n + 1 > cap) {
-                        cap = (buflen + (size_t) n + 1) * 2;
-                        if (!(nb = realloc(buf, cap)))
-                                break;
-                        buf = nb;
-                }
-                memcpy(buf + buflen, chunk, (size_t) n);
-                buflen += (size_t) n;
-                if (memchr(chunk, 0, (size_t) n))
-                        break;
+                if (!streq(sd_json_variant_string(key), name))
+                        continue;
+                if (field)
+                        return NULL;
+                field = sd_json_variant_by_index(object, i + 1);
         }
-        close(fd);
-        if (!buf)
-                return NULL;
-        buf[buflen] = 0;
-        if (sd_json_parse(buf, 0, &reply, NULL, NULL) < 0)
-                return NULL;
-        return reply;
+
+        return field;
+}
+
+static const char *policy_reason(const char *policy) {
+        if (streq(policy, "verified-boot"))
+                return "boot-verified";
+        if (streq(policy, "fresh-user-verification"))
+                return "verification-fresh";
+        if (streq(policy, "local-trusted-session"))
+                return "local-trusted-session";
+        return NULL;
+}
+
+static bool policy_satisfied(sd_json_variant *reply, const char *policy, const char *sid) {
+        sd_json_variant *parameters, *record, *field;
+        static const char *const string_fields[] = {
+                "policyId", "sessionId", "result", "reasonCode", "reason",
+        };
+
+        if (!sd_json_variant_is_object(reply) || sd_json_variant_by_key(reply, "error"))
+                return false;
+        if (sd_json_variant_by_key(reply, "continues")) {
+                field = json_field(reply, "continues");
+                if (!sd_json_variant_is_boolean(field) || sd_json_variant_boolean(field))
+                        return false;
+        }
+
+        parameters = json_field(reply, "parameters");
+        record = json_field(parameters, "result");
+        for (size_t i = 0; i < sizeof string_fields / sizeof string_fields[0]; i++)
+                if (!sd_json_variant_is_string(json_field(record, string_fields[i])))
+                        return false;
+        if (!sd_json_variant_is_unsigned(json_field(record, "windowSec")))
+                return false;
+
+        return streq(sd_json_variant_string(json_field(record, "policyId")), policy) &&
+               streq(sd_json_variant_string(json_field(record, "sessionId")), sid) &&
+               streq(sd_json_variant_string(json_field(record, "result")), "policy-satisfied") &&
+               streq(sd_json_variant_string(json_field(record, "reasonCode")), policy_reason(policy));
 }
 
 static void submit(pam_handle_t *pamh, const char *phase, const char *method, const char *result) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *reply = NULL;
+        _cleanup_free_ char *sid = NULL;
         const char *user = item(pamh, PAM_USER);
-        const char *sid = pam_getenv(pamh, "XDG_SESSION_ID");
-        struct passwd *pw = getpwnam(user);
+        uid_t uid;
 
-        if (!pw || !sid || !*sid)
+        if (session_subject(pamh, &sid, &uid) < 0)
                 return;
 
         if (sd_json_buildo(&params,
                 SD_JSON_BUILD_PAIR("user", SD_JSON_BUILD_STRING(user)),
-                SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(pw->pw_uid)),
+                SD_JSON_BUILD_PAIR("uid", SD_JSON_BUILD_UNSIGNED(uid)),
                 SD_JSON_BUILD_PAIR("pamService", SD_JSON_BUILD_STRING(item(pamh, PAM_SERVICE))),
                 SD_JSON_BUILD_PAIR("tty", SD_JSON_BUILD_STRING(item(pamh, PAM_TTY))),
                 SD_JSON_BUILD_PAIR("remoteHost", SD_JSON_BUILD_STRING(item(pamh, PAM_RHOST))),
                 SD_JSON_BUILD_PAIR("phase", SD_JSON_BUILD_STRING(phase)),
                 SD_JSON_BUILD_PAIR("declaredMethod", SD_JSON_BUILD_STRING(method)),
                 SD_JSON_BUILD_PAIR("result", SD_JSON_BUILD_STRING(result)),
-                SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(sid ?: ""))) < 0)
+                SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(sid))) < 0)
                 return;
-        reply = trustd_call("io.platformd.Trust.SubmitAuthEvent", params);
+        (void) pam_trust_call("io.platformd.Trust.SubmitAuthEvent", params, &reply);
 }
 
 /* An unavailable authority denies the policy. */
 static int gate(pam_handle_t *pamh, const char *policy) {
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *params = NULL, *reply = NULL;
-        const char *sid = pam_getenv(pamh, "XDG_SESSION_ID");
-        sd_json_variant *outer, *inner, *res;
+        _cleanup_free_ char *sid = NULL;
+
+        if (!policy_reason(policy))
+                return PAM_AUTH_ERR;
+        if (!streq(policy, "verified-boot") && session_subject(pamh, &sid, NULL) < 0)
+                return PAM_AUTH_ERR;
 
         if (sd_json_buildo(&params,
                 SD_JSON_BUILD_PAIR("policy", SD_JSON_BUILD_STRING(policy)),
                 SD_JSON_BUILD_PAIR("sessionId", SD_JSON_BUILD_STRING(sid ?: ""))) < 0)
                 return PAM_AUTH_ERR;
-        reply = trustd_call("io.platformd.Trust.EvaluatePolicy", params);
-        if (!reply || sd_json_variant_by_key(reply, "error"))
+        if (pam_trust_call("io.platformd.Trust.EvaluatePolicy", params, &reply) < 0)
                 return PAM_AUTH_ERR;
 
-        /* Raw replies retain the Varlink wire envelope. */
-        outer = sd_json_variant_by_key(reply, "parameters");
-        inner = outer ? sd_json_variant_by_key(outer, "result") : NULL;
-        res = inner ? sd_json_variant_by_key(inner, "result") : NULL;
-        return res && sd_json_variant_is_string(res) &&
-               streq(sd_json_variant_string(res), "policy-satisfied") ? PAM_SUCCESS : PAM_AUTH_ERR;
+        return policy_satisfied(reply, policy, sid ?: "") ? PAM_SUCCESS : PAM_AUTH_ERR;
 }
 
 int pam_sm_open_session(pam_handle_t *pamh, int flags, int argc, const char **argv) {

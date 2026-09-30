@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
 
 static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t) v; p[1] = (uint8_t) (v >> 8); }
 static void put32(uint8_t *p, uint32_t v) {
@@ -82,6 +83,15 @@ int main(void) {
         CHECK(pe_extract_section(img, img_len, ".nope", out) == 0);
         CHECK(pe_extract_section(junk, sizeof junk, ".foo", out) == -1);
         CHECK(pe_extract_section(img, 4, ".foo", out) == -1);
+        CHECK(pe_extract_section(img, tbl + 40, ".foo", out) == -EBADMSG);
+        memcpy(img + tbl + 40, ".foo", 4);
+        CHECK(pe_extract_section(img, img_len, ".foo", out) == -EOPNOTSUPP);
+        memcpy(img + tbl + 40, ".bar", 4);
+        put32(img + tbl + 8, 16);
+        CHECK(pe_extract_section(img, img_len, ".foo", out) == -EBADMSG);
+        put32(img + tbl + 8, 5);
+        put32(img + tbl + 16, 1000);
+        CHECK(pe_extract_section(img, img_len, ".foo", out) == -EBADMSG);
 
         unlink(out);
         printf("OK: pe_extract_section (VirtualSize content, absent, malformed)\n");

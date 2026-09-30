@@ -611,14 +611,15 @@ static int remove_boot_reference(const char *reference_id) {
 
 static int cmd_provision(const char *uki, const char *reference_id) {
         static const char *const secs[] = {
-                "linux", "osrel", "cmdline", "initrd", "uname", "sbat", "splash", "dtb", "ucode",
+                "linux", "osrel", "cmdline", "initrd", "ucode", "splash", "dtb", "uname", "sbat",
+                "pcrpkey", "dtbauto", "hwids", "profile", "efifw",
         };
         size_t nsec = sizeof secs / sizeof *secs;
         char tmpl[] = "/tmp/trustctl-provision.XXXXXX";
-        char section_file[9][PATH_MAX] = {};
-        char *measure_arg[9] = {};
+        char section_file[sizeof secs / sizeof *secs][PATH_MAX] = {};
+        char *measure_arg[sizeof secs / sizeof *secs] = {};
         _cleanup_free_ char *out = NULL;
-        char *margv[3 + 9 + 1];
+        char *margv[3 + sizeof secs / sizeof *secs + 1];
         int mc = 0, rc = EXIT_FAILURE, fd;
         struct stat st;
         uint8_t *img;
@@ -658,7 +659,12 @@ static int cmd_provision(const char *uki, const char *reference_id) {
                         goto finish;
                 }
                 snprintf(sect, sizeof sect, ".%s", secs[i]);
-                if (pe_extract_section(img, (size_t) st.st_size, sect, section_file[i]) > 0) {
+                long extracted = pe_extract_section(img, (size_t) st.st_size, sect, section_file[i]);
+                if (extracted < 0 || (i == 0 && extracted == 0)) {
+                        fprintf(stderr, "trustctl: invalid, missing, or unsupported UKI section %s\n", sect);
+                        goto finish;
+                }
+                if (extracted > 0) {
                         if (asprintf(&measure_arg[i], "--%s=%s", secs[i], section_file[i]) < 0) {
                                 measure_arg[i] = NULL;
                                 goto finish;
@@ -692,7 +698,7 @@ static void usage(void) {
                "  trustctl status                   Boot evidence and this session\n"
                "  trustctl pcrs                     TPM PCR bank (measured boot)\n"
                "  trustctl attest [nonceHex]        Produce a TPM quote (attestation)\n"
-               "  trustctl attest-token [nonceHex]  Full attestation as an IETF EAT token\n"
+               "  trustctl attest-token [nonceHex]  Platformd attestation evidence envelope\n"
                "  trustctl enroll                   EK/AK enrollment evidence (credential activation)\n"
                "  trustctl activate-credential <cred> <secret>  Answer a MakeCredential challenge\n"
                "  trustctl list-sessions            All tracked logind sessions\n"
