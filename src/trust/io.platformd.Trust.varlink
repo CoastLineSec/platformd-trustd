@@ -122,6 +122,7 @@ method SubmitAuthEvent(
 method ListAuthEvents() -> (events: []AuthEvent)
 
 type RuntimeEvent (
+        # Exact serialized runtime record, including timestamps and provenance.
         description: string,
         digest: string,
         realtimeUSec: int
@@ -129,9 +130,11 @@ type RuntimeEvent (
 
 # Authentication and lock state events are extended into a TPM NV index.
 # baseline precedes the retained window of at most 1024 events. current is the
-# live value. complete requires a matching replay and no measurement failure
+# live value. Version 2 replay extends SHA256(description), not description.
+# complete requires a matching replay and no measurement failure
 # during this service instance. Earlier history is not recovered on restart.
 method GetRuntimeLog() -> (
+        format: string,
         nvIndex: string,
         baseline: string,
         current: string,
@@ -154,6 +157,7 @@ method Attest(nonceHex: string) -> (
 
 # Produce a platformd-specific attestation envelope with embedded TPM evidence.
 # The legacy field name eat is retained; the format is not RFC 9711 EAT.
+# The v2 profile binds serialized runtime timestamps through the NV log.
 # The outer JSON and local assertions are unsigned. Restricted to user ID 0.
 method GetAttestationToken(nonceHex: string) -> (
         eat: string,

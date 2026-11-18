@@ -140,8 +140,11 @@
     to the TPM.</para>
 
     <para>Authentication events are declared evidence. TPM measurement protects
-    the recorded sequence from undetected modification after collection, but
-    does not verify a declared authentication method.</para>
+    the recorded sequence, timestamps, boot ID, and provenance from undetected
+    modification after collection. It does not verify a declared authentication
+    method or establish a trusted wall clock. The attestation profile is
+    <literal>io.platformd.Trust.Attestation.v2</literal>. Runtime replay extends
+    the SHA-256 digest of each serialized record, not its bytes directly.</para>
 
     <para>The runtime-log NV index must be initialized explicitly with
     <command>platformd-trustd --initialize-runtime-log</command>. The command

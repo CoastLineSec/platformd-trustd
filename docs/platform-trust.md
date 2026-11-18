@@ -181,7 +181,7 @@ TPM quote over the boot PCRs. Runtime events are extended into an NV index and
 certified with the same attestation key. `GetAttestationToken` combines the
 quote, measurements, and runtime log in an unsigned, platformd-specific JSON
 envelope. Its media type is `application/vnd.platformd.attestation+json` and
-its profile is `io.platformd.Trust.Attestation.v1`. The legacy Varlink output
+its profile is `io.platformd.Trust.Attestation.v2`. The legacy Varlink output
 field `eat` contains this envelope for interface compatibility. This is not an
 RFC 9711 Entity Attestation Token.
 
@@ -199,13 +199,38 @@ never create an index. The administrative command
 a conflicting definition. It does not replace or delete an existing index.
 Restart the service after initializing the index.
 
+The runtime log format is `io.platformd.Trust.RuntimeLog.v2`. Each event's
+`description` contains the exact compact JSON record measured by the service.
+Its `format` is `io.platformd.Trust.RuntimeEvent.v2`. The record includes the
+boot ID, `CLOCK_BOOTTIME` and `CLOCK_REALTIME` timestamps in microseconds, event
+type, source, evidence quality, and typed payload. Authentication payloads
+include all accepted event fields and the peer UID. The source identifies the
+submission interface, not an independently authenticated executable. Lock and
+sleep records identify the corresponding logind interface. Each event's clocks
+are sampled once; verification freshness uses the same authentication sample.
+
+Replay starts at `baseline`. For each event, compute `eventDigest =
+SHA256(description)` over the UTF-8 bytes of the returned JSON string, without a
+terminating NUL, then `next = SHA256(previous || eventDigest)`. Do not parse and
+reserialize the record before hashing. Records are limited to 8192 bytes; each
+NV extension contains the 32-byte event digest. A verifier must check the
+record and log versions. The outer `realtimeUSec` is a convenience copy, not
+independent evidence; the timestamp inside the measured record is authoritative
+and a verifier must reject a mismatch. Version 1 extended the description bytes directly and
+did not bind event timestamps. Its replay rule must not be used for version 2.
+
 The retained log is a window of at most 1024 events from the current service
-instance. Evicting an event advances `baseline` to its resulting digest. Replay
-starts at that baseline and computes `SHA256(previous || description)` over
-each description's UTF-8 bytes, without a terminating NUL. A restart establishes
-a new baseline and does not recover earlier event descriptions. Completeness
-applies to this retained window, not the entire boot. It requires a matching
-live NV value and no measurement failure during the service instance.
+instance. Evicting an event advances `baseline` to its resulting digest. A
+restart establishes a new baseline from the existing NV value and does not
+recover earlier records. This also applies when upgrading from version 1; the
+index is neither replaced nor cleared. Completeness applies to the retained
+window, not the entire boot. It requires a matching live NV value and no
+measurement failure during the service instance.
+
+The measured timestamps and boot ID remain host assertions. Their integrity
+does not establish an independently trusted clock or prove that authentication
+was recent. A fresh quote proves possession of the attestation key when the
+challenge was answered, not the age or method of an authentication event.
 
 `GetEnrollment` returns the Endorsement Key and Attestation Key public data.
 `ActivateCredential` completes a TPM credential activation exchange. A remote

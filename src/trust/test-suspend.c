@@ -114,6 +114,10 @@ static void check_submission(Manager *m, bool qualifies) {
         s = find_tracked(m, "test-session");
         assert(s);
         assert((seconds_since_verify(s) >= 0) == qualifies);
+        if (qualifies) {
+                assert(s->state.last_verification_boottime_usec == m->events->timestamp.boottime_usec);
+                assert(s->state.last_verification_realtime_usec == m->events->timestamp.realtime_usec);
+        }
 }
 
 static void check_policy(Manager *m, bool satisfied) {

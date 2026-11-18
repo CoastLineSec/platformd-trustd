@@ -12,6 +12,33 @@
 #include <tss2/tss2_tctildr.h>
 
 #include "attest.h"
+#include "runtime-event.h"
+
+static void test_runtime_record(uint8_t value[32]) {
+        RuntimeTimestamp timestamp = {
+                .boot_id = SD_ID128_MAKE(01,23,45,67,89,ab,cd,ef,01,23,45,67,89,ab,cd,ef),
+                .boottime_usec = 123,
+                .realtime_usec = 456,
+        };
+        sd_json_variant *payload = NULL;
+        uint8_t digest[32], expected[32], previous[32];
+        char *record = NULL;
+
+        assert(sd_json_buildo(&payload,
+                             SD_JSON_BUILD_PAIR_STRING("sessionId", "test-session"),
+                             SD_JSON_BUILD_PAIR_STRING("result", "failure")) >= 0);
+        assert(runtime_event_format(&timestamp, "authentication", "io.platformd.Trust.SubmitAuthEvent",
+                                    "declared", payload, &record) == 0);
+        memcpy(previous, value, sizeof previous);
+        assert(runtime_event_digest(record, digest) == 0);
+        assert(runtime_event_replay(previous, record, expected) == 0);
+        assert(attest_nv_extend(digest, sizeof digest, value) == 0);
+        assert(memcmp(value, expected, sizeof expected) == 0);
+        assert(attest_nv_read(previous) == 0);
+        assert(memcmp(value, previous, sizeof previous) == 0);
+        free(record);
+        sd_json_variant_unref(payload);
+}
 
 static void test_certificate(void) {
         const TPM2B_AUTH auth = {};
@@ -88,6 +115,7 @@ int main(int argc, char **argv) {
         assert(EVP_Q_digest(NULL, "SHA256", NULL, input, sizeof input, digest, NULL));
         assert(attest_nv_extend(nonce, sizeof nonce, value) == 0);
         assert(memcmp(value, digest, sizeof value) == 0);
+        test_runtime_record(value);
         assert(attest_nv_public(&public, &public_size) == 0);
         assert(Tss2_MU_TPM2B_NV_PUBLIC_Unmarshal(public, public_size, &offset, &nv) == TSS2_RC_SUCCESS);
         assert(offset == public_size);

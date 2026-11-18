@@ -19,7 +19,7 @@ trustd_deps = have_tpm2 ? [libsystemd, tss2_esys, tss2_mu, tss2_tctildr, libcryp
 
 trustd = executable(
         'platformd-trustd',
-        'trustd.c', attest_src, 'trust-util.c', 'verify.c', 'worker.c',
+        'trustd.c', attest_src, 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : trustd_deps,
         install : true,
         install_dir : get_option('libexecdir'),
@@ -27,7 +27,7 @@ trustd = executable(
 
 test_trustd = executable(
         'platformd-trustd-test',
-        'trustd.c', attest_src, 'trust-util.c', 'verify.c', 'worker.c', 'test-session.c',
+        'trustd.c', attest_src, 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c', 'test-session.c',
         dependencies : trustd_deps,
         c_args : '-DTRUSTD_TESTING',
         link_args : [
@@ -119,11 +119,18 @@ test('kernel-install', find_program('sh'),
      args : [meson.current_source_dir() / 'test-kernel-install.sh',
              meson.project_source_root() / 'units/70-platformd-trustd.install', trustctl])
 test('worker', executable('test-worker', 'test-worker.c', 'worker.c', dependencies : libsystemd))
-test_logind = executable('test-logind', 'test-logind.c', 'attest-stub.c', 'trust-util.c', 'verify.c', 'worker.c',
+test('runtime-event', executable('test-runtime-event', 'test-runtime-event.c', 'runtime-event.c',
+                                dependencies : [libsystemd, libcrypto],
+                                link_args : ['-Wl,--wrap=clock_gettime']))
+test('runtime-log', executable('test-runtime-log',
+        'test-runtime-log.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
+        dependencies : [libsystemd, libcrypto],
+        link_args : ['-Wl,--wrap=attest_nv_read', '-Wl,--wrap=attest_nv_extend']))
+test_logind = executable('test-logind', 'test-logind.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
                         dependencies : [libsystemd, libcrypto])
 test('logind', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_logind])
 test_suspend = executable('test-suspend',
-        'test-suspend.c', 'test-session.c', 'attest-stub.c', 'trust-util.c', 'verify.c', 'worker.c',
+        'test-suspend.c', 'test-session.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : [libsystemd, libcrypto],
         link_args : [
                 '-Wl,--wrap=sd_varlink_get_peer_uid',
@@ -138,14 +145,14 @@ test_suspend = executable('test-suspend',
         ])
 test('suspend', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_suspend])
 if have_tpm2
-        test_attest = executable('test-attest', 'test-attest.c', 'attest.c', dependencies : trustd_deps)
+        test_attest = executable('test-attest', 'test-attest.c', 'attest.c', 'runtime-event.c', dependencies : trustd_deps)
         test('attest', find_program('sh'),
              args : [meson.current_source_dir() / 'test-attest.sh', test_attest], timeout : 60)
 endif
 test('verify', executable('test-verify', 'test-verify.c', 'verify.c',
      dependencies : [libsystemd, libcrypto]))
 test_identity = executable('test-identity',
-        'test-identity.c', 'attest-stub.c', 'trust-util.c', 'verify.c', 'worker.c',
+        'test-identity.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : [libsystemd, libcrypto],
         link_args : [
                 '-Wl,--wrap=getpwuid',

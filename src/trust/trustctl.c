@@ -257,6 +257,7 @@ static int cmd_runtime_log(void) {
         }
         for (size_t i = 0; i < n; i++) {
                 sd_json_variant *e = sd_json_variant_by_index(arr, i);
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *record = NULL;
                 uint64_t us = juint(e, "realtimeUSec");
                 char when[16] = "-";
 
@@ -266,7 +267,12 @@ static int cmd_runtime_log(void) {
                         if (localtime_r(&t, &tm))
                                 strftime(when, sizeof when, "%H:%M:%S", &tm);
                 }
-                printf("  %s  %-40s %.16s...\n", when, jstr(e, "description"), jstr(e, "digest"));
+                if (sd_json_parse(jstr(e, "description"), 0, &record, NULL, NULL) >= 0 &&
+                    streq(jstr(record, "format"), "io.platformd.Trust.RuntimeEvent.v2"))
+                        printf("  %s  %-16s %-16s %.16s...\n", when, jstr(record, "type"),
+                               jstr(sd_json_variant_by_key(record, "payload"), "sessionId"), jstr(e, "digest"));
+                else
+                        printf("  %s  %-40s %.16s...\n", when, jstr(e, "description"), jstr(e, "digest"));
         }
         return EXIT_SUCCESS;
 }

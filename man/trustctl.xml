@@ -103,8 +103,10 @@
       <varlistentry>
         <term><command>runtime-log</command></term>
         <listitem><para>Show the runtime authentication measurement log: the
-        authentication and lock state events folded into the extend-only TPM NV index,
-        with the baseline and current values needed to replay it.</para></listitem>
+        authentication, lock, and sleep state events folded into the extend-only
+        TPM NV index, with the baseline and current values needed to replay it.
+        Version 2 extends the SHA-256 digest of each serialized record. Its boot
+        ID, timestamps, provenance, and payload are included in that digest.</para></listitem>
       </varlistentry>
 
       <varlistentry>
