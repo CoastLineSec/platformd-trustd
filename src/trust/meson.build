@@ -89,7 +89,9 @@ if libpam.found() and cc.has_header('security/pam_modules.h')
                         '-Wl,--wrap=getsockopt',
                         '-Wl,--wrap=send',
                         '-Wl,--wrap=recv',
+                        '-Wl,--wrap=__recv_chk',
                         '-Wl,--wrap=poll',
+                        '-Wl,--wrap=clock_gettime',
                 ],
         )
         test('pam-transport', find_program('sh'),

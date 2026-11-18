@@ -30,7 +30,7 @@ static int monotonic_now(uint64_t *ret) {
         struct timespec ts;
 
         if (clock_gettime(CLOCK_MONOTONIC, &ts) < 0)
-                return -errno;
+                return errno > 0 ? -errno : -EIO;
 
         *ret = (uint64_t) ts.tv_sec * NSEC_PER_SEC + (uint64_t) ts.tv_nsec;
         return 0;

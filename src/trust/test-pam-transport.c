@@ -44,11 +44,22 @@ int __real_getsockopt(int fd, int level, int option, void *value, socklen_t *len
 ssize_t __real_send(int fd, const void *buffer, size_t size, int flags);
 ssize_t __real_recv(int fd, void *buffer, size_t size, int flags);
 int __real_poll(struct pollfd *fds, nfds_t n, int timeout);
+int __real_clock_gettime(clockid_t clock, struct timespec *ts);
 
 static struct sockaddr_un private_address = { .sun_family = AF_UNIX };
 static TestMode test_mode;
 static unsigned connect_calls, credential_calls, socket_error_calls, send_calls, recv_calls, poll_calls;
 static int ready_fd;
+static unsigned clock_calls, clock_failure;
+static int clock_error;
+
+int __wrap_clock_gettime(clockid_t clock, struct timespec *ts) {
+        if (clock == CLOCK_MONOTONIC && ++clock_calls == clock_failure) {
+                errno = clock_error;
+                return -1;
+        }
+        return __real_clock_gettime(clock, ts);
+}
 
 static bool test_async_failure(void) {
         return test_mode == TEST_ASYNC_REFUSED || test_mode == TEST_ASYNC_SHORT_ERROR ||
@@ -136,18 +147,35 @@ ssize_t __wrap_send(int fd, const void *buffer, size_t size, int flags) {
         return __real_send(fd, buffer, size, flags);
 }
 
-ssize_t __wrap_recv(int fd, void *buffer, size_t size, int flags) {
+static int prepare_recv(size_t *size) {
         recv_calls++;
         if (test_mode == TEST_SHORT_IO) {
                 if (recv_calls == 1) {
                         errno = EINTR;
                         return -1;
                 }
-                if (size > 2)
-                        size = 2;
+                if (*size > 2)
+                        *size = 2;
         }
+        return 0;
+}
+
+ssize_t __wrap_recv(int fd, void *buffer, size_t size, int flags) {
+        if (prepare_recv(&size) < 0)
+                return -1;
         return __real_recv(fd, buffer, size, flags);
 }
+
+#ifdef __GLIBC__
+ssize_t __real___recv_chk(int fd, void *buffer, size_t size, size_t capacity, int flags);
+
+ssize_t __wrap___recv_chk(int fd, void *buffer, size_t size, size_t capacity, int flags) {
+        CHECK(size <= capacity);
+        if (prepare_recv(&size) < 0)
+                return -1;
+        return __real___recv_chk(fd, buffer, size, capacity, flags);
+}
+#endif
 
 int __wrap_poll(struct pollfd *fds, nfds_t n, int timeout) {
         poll_calls++;
@@ -341,6 +369,22 @@ static void test_invalid_arguments(void) {
         sd_json_variant_unref(params);
 }
 
+static void test_clock_failure(unsigned call, int error) {
+        sd_json_variant *params = NULL, *reply;
+
+        CHECK(sd_json_buildo(&params, SD_JSON_BUILD_PAIR_STRING("policy", "test-policy")) >= 0);
+        clock_calls = connect_calls = send_calls = 0;
+        clock_failure = call;
+        clock_error = error;
+        reply = params;
+        CHECK(pam_trust_call("io.platformd.Trust.EvaluatePolicy", params, &reply) ==
+              (error > 0 ? -error : -EIO));
+        CHECK(!reply && connect_calls == 0 && send_calls == 0);
+        CHECK(clock_calls == call);
+        clock_failure = 0;
+        sd_json_variant_unref(params);
+}
+
 int main(void) {
         static const char valid[] = "{\"parameters\":{\"result\":{\"result\":\"policy-satisfied\"}}}";
         static const char trailing[] = "{}\0trailing";
@@ -352,6 +396,10 @@ int main(void) {
         CHECK(setenv("PLATFORMD_TRUSTD_RUNTIME", "/nonexistent/untrusted", 1) == 0);
 
         test_invalid_arguments();
+        test_clock_failure(1, EINVAL);
+        test_clock_failure(1, 0);
+        test_clock_failure(2, EINVAL);
+        test_clock_failure(2, 0);
         test_connect_failure(TEST_CONNECT_REFUSED, -ECONNREFUSED);
         test_connect_failure(TEST_ASYNC_REFUSED, -ECONNREFUSED);
         test_connect_failure(TEST_ASYNC_SHORT_ERROR, -EIO);
