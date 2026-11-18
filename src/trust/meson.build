@@ -120,6 +120,21 @@ test('worker', executable('test-worker', 'test-worker.c', 'worker.c', dependenci
 test_logind = executable('test-logind', 'test-logind.c', 'attest-stub.c', 'trust-util.c', 'verify.c', 'worker.c',
                         dependencies : [libsystemd, libcrypto])
 test('logind', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_logind])
+test_suspend = executable('test-suspend',
+        'test-suspend.c', 'test-session.c', 'attest-stub.c', 'trust-util.c', 'verify.c', 'worker.c',
+        dependencies : [libsystemd, libcrypto],
+        link_args : [
+                '-Wl,--wrap=sd_varlink_get_peer_uid',
+                '-Wl,--wrap=sd_varlink_reply',
+                '-Wl,--wrap=sd_varlink_error',
+                '-Wl,--wrap=sd_journal_send',
+                '-Wl,--wrap=sd_session_get_uid',
+                '-Wl,--wrap=sd_session_get_username',
+                '-Wl,--wrap=sd_session_get_class',
+                '-Wl,--wrap=sd_session_is_active',
+                '-Wl,--wrap=sd_session_is_remote',
+        ])
+test('suspend', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_suspend])
 if have_tpm2
         test_attest = executable('test-attest', 'test-attest.c', 'attest.c', dependencies : trustd_deps)
         test('attest', find_program('sh'),

@@ -21,9 +21,15 @@ static int get_locked(sd_bus *bus, const char *path, const char *interface, cons
         return sd_bus_message_append(reply, "b", locked);
 }
 
+static int get_preparing(sd_bus *bus, const char *path, const char *interface, const char *property,
+                         sd_bus_message *reply, void *userdata, sd_bus_error *error) {
+        return sd_bus_message_append(reply, "b", false);
+}
+
 static const sd_bus_vtable manager_vtable[] = {
         SD_BUS_VTABLE_START(0),
         SD_BUS_METHOD("ListSessions", "", "a(susso)", list_sessions, SD_BUS_VTABLE_UNPRIVILEGED),
+        SD_BUS_PROPERTY("PreparingForSleep", "b", get_preparing, 0, 0),
         SD_BUS_VTABLE_END,
 };
 
@@ -88,6 +94,7 @@ int main(void) {
         s = find_tracked(&m, "test-session");
         assert(s->state.last_verification_boottime_usec == 0);
 
+        forget_sleep_state(&m);
         forget_sessions(&m);
         while (m.backend_head) {
                 BackendRequest *q = m.backend_head;

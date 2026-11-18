@@ -93,7 +93,11 @@ The event must name an existing eligible session owned by the declared user ID.
 The declared user name must match logind's name for that session. Verification events do
 not change lock state.
 
-Freshness is measured with `CLOCK_BOOTTIME`. It is cleared before suspend.
+Freshness is measured with `CLOCK_BOOTTIME`. Sleep preparation and its completion
+both clear freshness, including canceled sleep attempts. Authentication events
+received while preparation is active or its state is unavailable do not establish
+freshness. The preparation state is queried at startup and after logind owner
+changes; unavailable state is retried.
 The default freshness window is 300 seconds. It may be changed with
 `$PLATFORMD_TRUST_FRESH_WINDOW_SEC` in the service environment, from 1 to 86400.
 

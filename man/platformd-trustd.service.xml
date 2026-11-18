@@ -71,7 +71,10 @@
     session owned by the declared user ID.</para>
 
     <para>Freshness uses <constant>CLOCK_BOOTTIME</constant>, has a default
-    window of 300 seconds, and is cleared before suspend. The window may be set
+    window of 300 seconds. Sleep preparation and its completion both clear
+    freshness, including canceled sleep attempts. Events received while sleep
+    preparation is active or its state is unavailable do not establish freshness.
+    The window may be set
     with <varname>$PLATFORMD_TRUST_FRESH_WINDOW_SEC</varname>.</para>
   </refsect1>
 

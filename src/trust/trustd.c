@@ -87,6 +87,9 @@ typedef struct Manager {
         sd_json_variant *identities;
         sd_bus_slot *session_query;
         sd_event_source *reconnect;
+        sd_bus_slot *sleep_query;
+        sd_event_source *sleep_retry;
+        int preparing_for_sleep;
         uint64_t session_generation, query_generation;
         struct BackendRequest *backend_head, *backend_tail;
         sd_json_variant *backend_result;
@@ -906,6 +909,62 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
 
 static void setup_logind(Manager *m);
 static int enumerate_sessions(Manager *m);
+static void query_preparing_for_sleep(Manager *m);
+
+static void set_preparing_for_sleep(Manager *m, int preparing) {
+        m->preparing_for_sleep = preparing;
+        for (TrackedSession *s = m->sessions; s; s = s->next)
+                trust_session_invalidate_verification(&s->state);
+}
+
+static void forget_sleep_state(Manager *m) {
+        m->sleep_query = sd_bus_slot_unref(m->sleep_query);
+        m->sleep_retry = sd_event_source_unref(m->sleep_retry);
+        set_preparing_for_sleep(m, -1);
+}
+
+static int on_sleep_retry(sd_event_source *source, uint64_t usec, void *userdata) {
+        Manager *m = userdata;
+
+        m->sleep_retry = sd_event_source_unref(m->sleep_retry);
+        query_preparing_for_sleep(m);
+        return 0;
+}
+
+static void schedule_sleep_retry(Manager *m) {
+        if (!m->sleep_retry)
+                (void) sd_event_add_time(m->event, &m->sleep_retry, CLOCK_BOOTTIME,
+                                        now_boottime() + 2000000, 0, on_sleep_retry, m);
+}
+
+static int on_preparing_for_sleep(sd_bus_message *message, void *userdata, sd_bus_error *error) {
+        Manager *m = userdata;
+        int preparing = -1;
+
+        m->sleep_query = sd_bus_slot_unref(m->sleep_query);
+        if (sd_bus_message_is_method_error(message, NULL) ||
+            sd_bus_message_enter_container(message, 'v', "b") <= 0 ||
+            sd_bus_message_read(message, "b", &preparing) <= 0 ||
+            sd_bus_message_exit_container(message) < 0 ||
+            sd_bus_message_at_end(message, true) <= 0)
+                preparing = -1;
+        set_preparing_for_sleep(m, preparing);
+        if (preparing < 0)
+                schedule_sleep_retry(m);
+        return 0;
+}
+
+static void query_preparing_for_sleep(Manager *m) {
+        _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
+
+        forget_sleep_state(m);
+        if (!m->bus ||
+            sd_bus_message_new_method_call(m->bus, &request, "org.freedesktop.login1", "/org/freedesktop/login1",
+                                           "org.freedesktop.DBus.Properties", "Get") < 0 ||
+            sd_bus_message_append(request, "ss", "org.freedesktop.login1.Manager", "PreparingForSleep") < 0 ||
+            sd_bus_call_async(m->bus, &m->sleep_query, request, on_preparing_for_sleep, m, 2000000) < 0)
+                schedule_sleep_retry(m);
+}
 
 static void forget_sessions(Manager *m) {
         m->session_query = sd_bus_slot_unref(m->session_query);
@@ -989,13 +1048,17 @@ static int on_session_removed(sd_bus_message *msg, void *userdata, sd_bus_error 
 
 static int on_prepare_for_sleep(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
-        int sleeping;
+        int preparing = -1;
 
-        if (sd_bus_message_read(msg, "b", &sleeping) <= 0 || !sleeping)
-                return 0;
-        for (TrackedSession *s = m->sessions; s; s = s->next)
-                trust_session_invalidate_verification(&s->state);
-        record_runtime_event(m, "sleep freshness=invalidated");
+        forget_sleep_state(m);
+        if (sd_bus_message_read(msg, "b", &preparing) <= 0 ||
+            sd_bus_message_at_end(msg, true) <= 0)
+                preparing = -1;
+        set_preparing_for_sleep(m, preparing);
+        if (preparing < 0)
+                schedule_sleep_retry(m);
+        record_runtime_event(m, preparing < 0 ? "sleep-state unknown freshness=invalidated" :
+                                preparing ? "sleep freshness=invalidated" : "resume freshness=invalidated");
         return 0;
 }
 
@@ -1041,15 +1104,19 @@ static int on_logind_owner(sd_bus_message *msg, void *userdata, sd_bus_error *er
             !streq(name, "org.freedesktop.login1") || streq(old_owner, new_owner))
                 return 0;
         m->session_generation++;
+        forget_sleep_state(m);
         forget_sessions(m);
-        if (*new_owner)
+        if (*new_owner) {
+                query_preparing_for_sleep(m);
                 (void) enumerate_sessions(m);
+        }
         return 0;
 }
 
 static int on_bus_disconnected(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
         Manager *m = userdata;
 
+        forget_sleep_state(m);
         forget_sessions(m);
         return sd_event_exit(m->event, EXIT_FAILURE);
 }
@@ -1071,6 +1138,7 @@ static int on_reconnect(sd_event_source *source, uint64_t usec, void *userdata) 
 static void setup_logind(Manager *m) {
         int r;
 
+        forget_sleep_state(m);
         r = sd_bus_open_system(&m->bus);
         if (r < 0 || sd_bus_attach_event(m->bus, m->event, SD_EVENT_PRIORITY_NORMAL) < 0)
                 goto fail;
@@ -1103,8 +1171,10 @@ static void setup_logind(Manager *m) {
                                "org.freedesktop.DBus.Local", "Disconnected", on_bus_disconnected, m);
         if (r < 0 || enumerate_sessions(m) < 0)
                 goto fail;
+        query_preparing_for_sleep(m);
         return;
 fail:
+        forget_sleep_state(m);
         forget_sessions(m);
         m->bus = sd_bus_flush_close_unref(m->bus);
         (void) sd_event_add_time(m->event, &m->reconnect, CLOCK_BOOTTIME, now_boottime() + 5000000,
@@ -1239,6 +1309,7 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
         e->qualifies_for_freshness =
                 tracked &&
                 class_eligible &&
+                m->preparing_for_sleep == 0 &&
                 trust_auth_event_qualifies(service, phase, method, result);
 
         e->next = m->events;
@@ -2100,6 +2171,7 @@ int main(int argc, char **argv) {
                 manager.identity_requests = q->next;
                 identity_free(q);
         }
+        forget_sleep_state(&manager);
         forget_sessions(&manager);
         sd_event_source_unref(manager.reconnect);
         while (manager.events) {
