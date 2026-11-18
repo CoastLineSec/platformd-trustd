@@ -82,6 +82,97 @@ static void test_certificate(void) {
         Tss2_TctiLdr_Finalize(&tcti);
 }
 
+static void test_activation_rejected(const uint8_t *credential, size_t credential_size,
+                                     const uint8_t *secret, size_t secret_size, int expected) {
+        uint8_t *challenge = NULL;
+        size_t challenge_size = 0;
+
+        assert(attest_activate_credential(credential, credential_size, secret, secret_size,
+                                          &challenge, &challenge_size) == expected);
+        assert(!challenge && challenge_size == 0);
+}
+
+static void test_activation(void) {
+        const TPM2B_DIGEST expected = {
+                .size = 32,
+                .buffer = { 0x23, 0x91, 0x84, 0x6c, 0x72, 0xde, 0x5a, 0x08 },
+        };
+        ESYS_CONTEXT *context = NULL;
+        TSS2_TCTI_CONTEXT *tcti = NULL;
+        ESYS_TR external = ESYS_TR_NONE;
+        TPM2B_PUBLIC public;
+        TPM2B_NAME name = {};
+        uint8_t *ek = NULL, *cert = NULL, *ak = NULL, *ak_name = NULL;
+        size_t ek_size, cert_size, ak_size, name_size, offset = 0;
+
+        assert(attest_get_enrollment(&ek, &ek_size, &cert, &cert_size, &ak, &ak_size,
+                                     &ak_name, &name_size) == 0);
+        assert(Tss2_MU_TPM2B_PUBLIC_Unmarshal(ek, ek_size, &offset, &public) == TSS2_RC_SUCCESS);
+        assert(offset == ek_size);
+        assert(name_size > 0 && name_size <= sizeof name.name);
+        name.size = name_size;
+        memcpy(name.name, ak_name, name_size);
+
+        assert(Tss2_TctiLdr_Initialize(getenv("TSS2_TCTI"), &tcti) == TSS2_RC_SUCCESS);
+        assert(Esys_Initialize(&context, tcti, NULL) == TSS2_RC_SUCCESS);
+        assert(Esys_SetTimeout(context, 2000) == TSS2_RC_SUCCESS);
+        assert(Esys_LoadExternal(context, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                 NULL, &public, ESYS_TR_RH_NULL, &external) == TSS2_RC_SUCCESS);
+
+        for (unsigned wrong_name = 0; wrong_name < 2; wrong_name++) {
+                TPM2B_ID_OBJECT *credential = NULL;
+                TPM2B_ENCRYPTED_SECRET *secret = NULL;
+                uint8_t credential_buffer[sizeof(TPM2B_ID_OBJECT) + 1],
+                        secret_buffer[sizeof(TPM2B_ENCRYPTED_SECRET) + 1], *challenge = NULL;
+                size_t credential_size = 0, secret_size = 0, challenge_size = 0;
+
+                if (wrong_name)
+                        name.name[name.size - 1] ^= 1;
+                assert(Esys_MakeCredential(context, external, ESYS_TR_NONE, ESYS_TR_NONE, ESYS_TR_NONE,
+                                           &expected, &name, &credential, &secret) == TSS2_RC_SUCCESS);
+                assert(Tss2_MU_TPM2B_ID_OBJECT_Marshal(credential, credential_buffer, sizeof credential_buffer,
+                                                      &credential_size) == TSS2_RC_SUCCESS);
+                assert(Tss2_MU_TPM2B_ENCRYPTED_SECRET_Marshal(secret, secret_buffer, sizeof secret_buffer,
+                                                             &secret_size) == TSS2_RC_SUCCESS);
+                assert(credential_size > 0 && credential_size < sizeof credential_buffer);
+                assert(secret_size > 0 && secret_size < sizeof secret_buffer);
+                Esys_Free(credential);
+                Esys_Free(secret);
+
+                if (wrong_name) {
+                        test_activation_rejected(credential_buffer, credential_size, secret_buffer, secret_size, -EIO);
+                        continue;
+                }
+
+                assert(attest_activate_credential(credential_buffer, credential_size, secret_buffer, secret_size,
+                                                  &challenge, &challenge_size) == 0);
+                assert(challenge_size == expected.size);
+                assert(memcmp(challenge, expected.buffer, challenge_size) == 0);
+                free(challenge);
+
+                for (size_t i = 0; i < credential_size; i++)
+                        test_activation_rejected(credential_buffer, i, secret_buffer, secret_size, -EINVAL);
+                for (size_t i = 0; i < secret_size; i++)
+                        test_activation_rejected(credential_buffer, credential_size, secret_buffer, i, -EINVAL);
+
+                credential_buffer[credential_size] = 0;
+                test_activation_rejected(credential_buffer, credential_size + 1, secret_buffer, secret_size, -EINVAL);
+                secret_buffer[secret_size] = 0;
+                test_activation_rejected(credential_buffer, credential_size, secret_buffer, secret_size + 1, -EINVAL);
+
+                credential_buffer[credential_size - 1] ^= 1;
+                test_activation_rejected(credential_buffer, credential_size, secret_buffer, secret_size, -EIO);
+        }
+
+        assert(Esys_FlushContext(context, external) == TSS2_RC_SUCCESS);
+        Esys_Finalize(&context);
+        Tss2_TctiLdr_Finalize(&tcti);
+        free(ek);
+        free(cert);
+        free(ak);
+        free(ak_name);
+}
+
 int main(int argc, char **argv) {
         static const uint8_t nonce[] = { 1, 2, 3, 4 };
         uint8_t value[32], digest[32], input[36] = {}, *ak = NULL, *info = NULL, *signature = NULL, *public = NULL;
@@ -134,5 +225,6 @@ int main(int argc, char **argv) {
         free(info);
         free(signature);
         test_certificate();
+        test_activation();
         return 0;
 }

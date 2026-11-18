@@ -529,10 +529,12 @@ int attest_activate_credential(const uint8_t *cred, size_t cred_len,
 
         *challenge = NULL;
         *challenge_len = 0;
-        if (Tss2_MU_TPM2B_ID_OBJECT_Unmarshal(cred, cred_len, &off, &cred_blob) != TSS2_RC_SUCCESS)
+        if (Tss2_MU_TPM2B_ID_OBJECT_Unmarshal(cred, cred_len, &off, &cred_blob) != TSS2_RC_SUCCESS ||
+            off != cred_len)
                 return -EINVAL;
         off = 0;
-        if (Tss2_MU_TPM2B_ENCRYPTED_SECRET_Unmarshal(secret, secret_len, &off, &enc_secret) != TSS2_RC_SUCCESS)
+        if (Tss2_MU_TPM2B_ENCRYPTED_SECRET_Unmarshal(secret, secret_len, &off, &enc_secret) != TSS2_RC_SUCCESS ||
+            off != secret_len)
                 return -EINVAL;
 
         if ((r = esys_initialize(&ctx, &tcti)) < 0)
