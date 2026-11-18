@@ -148,6 +148,10 @@ test_enrollment_cli = executable('test-enrollment-cli',
         dependencies : [libsystemd, libcrypto])
 test('enrollment-cli', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_enrollment_cli, test_attestation_verify], timeout : 60)
+test('remote-consumer', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-env.sh', find_program('python3').full_path(), '-I', '-B',
+             meson.current_source_dir() / 'test-remote-consumer.py', trustctl, test_attestation_verify],
+     timeout : 120)
 test_endorsement = executable('test-endorsement', 'test-endorsement.c', 'endorsement.c',
                              'enrollment.c', 'attestation-verify.c', dependencies : [libsystemd, libcrypto])
 test('endorsement', test_endorsement, timeout : 60)

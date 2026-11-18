@@ -2,17 +2,20 @@
 
 #undef NDEBUG
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <openssl/core_names.h>
 #include <openssl/ecdsa.h>
 #include <openssl/evp.h>
+#include <openssl/pem.h>
 
 #include "attestation-verify.h"
 
@@ -116,6 +119,22 @@ typedef struct Fixture {
         char *ak;
         char *nonce;
 } Fixture;
+
+typedef struct FixtureRequest {
+        uint32_t uid;
+        char session[257];
+        char challenge[65];
+        char audience[257];
+        char operation[65];
+} FixtureRequest;
+
+static const FixtureRequest default_request = {
+        .uid = 1000,
+        .session = "fixture-session",
+        .challenge = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+        .audience = "https://service.example",
+        .operation = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+};
 
 static unsigned accepted_tokens, rejected_tokens;
 
@@ -254,7 +273,7 @@ static Buffer header(bool nv, const uint8_t signer[34], const uint8_t nonce[32],
         return b;
 }
 
-static char *record(unsigned index, Fault fault) {
+static char *record(unsigned index, Fault fault, const FixtureRequest *request) {
         if (fault == VALID_CONTEXT_THEN_LOCK)
                 fault = index == 0 ? VALID_CONTEXT : FAULT_NONE;
         else if (fault == VALID_CONTEXT_THEN_UNLOCK)
@@ -300,7 +319,7 @@ static char *record(unsigned index, Fault fault) {
                 quality = "declared";
                 assert(sd_json_buildo(&payload,
                                      SD_JSON_BUILD_PAIR_STRING("user", "fixture-user"),
-                                     SD_JSON_BUILD_PAIR_UNSIGNED("uid", fault == FAULT_AUTH_UID ? UINT32_MAX : 1000),
+                                     SD_JSON_BUILD_PAIR_UNSIGNED("uid", fault == FAULT_AUTH_UID ? UINT32_MAX : request->uid),
                                      SD_JSON_BUILD_PAIR_STRING("pamService", login ? "fixture-login" :
                                                               fault == FAULT_AUTH_SERVICE ? "other-service" : "platformd-verify"),
                                      SD_JSON_BUILD_PAIR_STRING("tty", "tty1"),
@@ -309,7 +328,7 @@ static char *record(unsigned index, Fault fault) {
                                      SD_JSON_BUILD_PAIR_STRING("declaredMethod", login ? "pam-policy" : "platformd-verify"),
                                      SD_JSON_BUILD_PAIR_STRING("result", fault == VALID_VERIFY_FAILURE || fault == FAULT_LOGIN_RESULT ?
                                                               "failure" : "success"),
-                                     SD_JSON_BUILD_PAIR_STRING("sessionId", "fixture-session"),
+                                     SD_JSON_BUILD_PAIR_STRING("sessionId", request->session),
                                      SD_JSON_BUILD_PAIR_BOOLEAN("qualifiesForFreshness", fault != VALID_VERIFY_FAILURE),
                                      SD_JSON_BUILD_PAIR_UNSIGNED("realtimeUSec", fault == FAULT_AUTH_TIMESTAMP ? 0 : 1000000 + index),
                                      SD_JSON_BUILD_PAIR_STRING("evidenceQuality", fault == FAULT_AUTH_QUALITY ? "verified" : "declared"),
@@ -338,10 +357,10 @@ static char *record(unsigned index, Fault fault) {
 
                         assert(sd_json_buildo(&value,
                                              SD_JSON_BUILD_PAIR_STRING("challengeHex", fault == FAULT_CONTEXT_CHALLENGE ? "01" :
-                                                                      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
-                                             SD_JSON_BUILD_PAIR_STRING("audience", fault == FAULT_CONTEXT_AUDIENCE ? "\n" : "https://service.example"),
+                                                                      request->challenge),
+                                             SD_JSON_BUILD_PAIR_STRING("audience", fault == FAULT_CONTEXT_AUDIENCE ? "\n" : request->audience),
                                              SD_JSON_BUILD_PAIR_STRING("operationDigestHex", fault == FAULT_CONTEXT_DIGEST ? "not-hex" :
-                                                                      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) >= 0);
+                                                                      request->operation)) >= 0);
                         if (fault == FAULT_CONTEXT_EXTRA)
                                 assert(sd_json_variant_set_field_string(&value, "extra", "") >= 0);
                         if (fault == FAULT_CONTEXT_DUPLICATE) {
@@ -373,7 +392,7 @@ static char *record(unsigned index, Fault fault) {
                                      SD_JSON_BUILD_PAIR_BOOLEAN("freshnessInvalidated", fault != FAULT_SLEEP_INVALIDATION)) >= 0);
         } else
                 assert(sd_json_buildo(&payload,
-                                     SD_JSON_BUILD_PAIR_STRING("sessionId", fault == VALID_OTHER_SESSION_LOCK ? "other-session" : "fixture-session"),
+                                     SD_JSON_BUILD_PAIR_STRING("sessionId", fault == VALID_OTHER_SESSION_LOCK ? "other-session" : request->session),
                                      SD_JSON_BUILD_PAIR_STRING("lockState", fault == FAULT_RECORD_PAYLOAD ? "yes" :
                                                               fault == VALID_UNLOCKED ? "unlocked" :
                                                               fault == VALID_UNKNOWN_LOCK ? "unknown" : "locked"),
@@ -406,7 +425,7 @@ static char *record(unsigned index, Fault fault) {
         return text;
 }
 
-static Fixture fixture_new(EVP_PKEY *key, unsigned n_events, Fault fault) {
+static Fixture fixture_new_full(EVP_PKEY *key, unsigned n_events, Fault fault, const FixtureRequest *request) {
         sd_json_variant *quote = NULL, *boot = NULL, *runtime = NULL, *pcrs = NULL, *events = NULL;
         sd_json_variant *measurements = NULL, *ak = NULL, *local = NULL;
         uint8_t signer[34], nonce[32], pcr_values[16][32], hash[32], current[32], baseline[32];
@@ -414,8 +433,12 @@ static Fixture fixture_new(EVP_PKEY *key, unsigned n_events, Fault fault) {
         Buffer public, q, nv, nv_public = {}, wrapped = {};
         Fixture f = {};
 
-        for (unsigned i = 0; i < sizeof nonce; i++)
-                nonce[i] = (uint8_t) i;
+        for (unsigned i = 0; i < sizeof nonce; i++) {
+                unsigned value;
+
+                assert(sscanf(request->challenge + i * 2, "%2x", &value) == 1);
+                nonce[i] = (uint8_t) value;
+        }
         memset(baseline, 0xa5, sizeof baseline);
         memcpy(current, baseline, sizeof current);
         public = public_key(key, fault, signer);
@@ -425,7 +448,7 @@ static Fixture fixture_new(EVP_PKEY *key, unsigned n_events, Fault fault) {
         for (unsigned i = 0; i < n_events; i++) {
                 sd_json_variant *event = NULL;
                 uint8_t input[64];
-                char *description = record(i, fault);
+                char *description = record(i, fault, request);
 
                 memcpy(input, current, sizeof current);
                 digest(description, strlen(description), input + 32);
@@ -518,6 +541,10 @@ static Fixture fixture_new(EVP_PKEY *key, unsigned n_events, Fault fault) {
         sd_json_variant_unref(ak);
         sd_json_variant_unref(local);
         return f;
+}
+
+static Fixture fixture_new(EVP_PKEY *key, unsigned n_events, Fault fault) {
+        return fixture_new_full(key, n_events, fault, &default_request);
 }
 
 static void fixture_done(Fixture *f) {
@@ -866,8 +893,138 @@ static void test_unsigned_assertions(EVP_PKEY *key) {
         fixture_done(&f);
 }
 
-static void write_fixture(EVP_PKEY *key, const char *directory, Fault fault) {
-        Fixture f = fixture_new(key, 3, fault);
+static bool object_fields(sd_json_variant *object, const char *const *fields, size_t n) {
+        if (!sd_json_variant_is_object(object) || sd_json_variant_elements(object) != n * 2)
+                return false;
+        for (size_t i = 0; i < n; i++)
+                if (!sd_json_variant_by_key(object, fields[i]))
+                        return false;
+        return true;
+}
+
+static bool request_string(sd_json_variant *object, const char *field, char *ret, size_t capacity, bool hex_value) {
+        sd_json_variant *value = sd_json_variant_by_key(object, field);
+        const char *s;
+        size_t n;
+
+        if (!sd_json_variant_is_string(value))
+                return false;
+        s = sd_json_variant_string(value);
+        n = strlen(s);
+        if (n == 0 || n >= capacity || (hex_value && n != 64))
+                return false;
+        for (size_t i = 0; i < n; i++)
+                if (hex_value ? !((s[i] >= '0' && s[i] <= '9') || (s[i] >= 'a' && s[i] <= 'f')) :
+                    (unsigned char) s[i] < 0x20 || (unsigned char) s[i] > 0x7e)
+                        return false;
+        memcpy(ret, s, n + 1);
+        return true;
+}
+
+static bool request_parse(sd_json_variant *value, FixtureRequest *ret) {
+        static const char *const fields[] = { "uid", "sessionId", "context" };
+        static const char *const context_fields[] = { "challengeHex", "audience", "operationDigestHex" };
+        FixtureRequest request = {};
+        sd_json_variant *uid, *context;
+
+        if (!object_fields(value, fields, sizeof fields / sizeof fields[0]))
+                return false;
+        uid = sd_json_variant_by_key(value, "uid");
+        if ((sd_json_variant_type(uid) != SD_JSON_VARIANT_INTEGER && sd_json_variant_type(uid) != SD_JSON_VARIANT_UNSIGNED) ||
+            !sd_json_variant_is_unsigned(uid) || sd_json_variant_unsigned(uid) >= UINT32_MAX)
+                return false;
+        request.uid = (uint32_t) sd_json_variant_unsigned(uid);
+        context = sd_json_variant_by_key(value, "context");
+        if (!object_fields(context, context_fields, sizeof context_fields / sizeof context_fields[0]) ||
+            !request_string(value, "sessionId", request.session, sizeof request.session, false) ||
+            !request_string(context, "challengeHex", request.challenge, sizeof request.challenge, true) ||
+            !request_string(context, "audience", request.audience, sizeof request.audience, false) ||
+            !request_string(context, "operationDigestHex", request.operation, sizeof request.operation, true))
+                return false;
+        *ret = request;
+        return true;
+}
+
+static char *read_fixture_input(const char *path) {
+        char *text = malloc(65537);
+        size_t size = 0;
+        struct stat st;
+        int fd;
+
+        assert(text);
+        fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC | O_NOFOLLOW);
+        assert(fd >= 0);
+        assert(fstat(fd, &st) == 0 && S_ISREG(st.st_mode) && st.st_size >= 0 && st.st_size <= 65536);
+        for (;;) {
+                ssize_t n = read(fd, text + size, 65537 - size);
+
+                if (n < 0 && errno == EINTR)
+                        continue;
+                assert(n >= 0);
+                if (n == 0)
+                        break;
+                size += (size_t) n;
+                assert(size <= 65536);
+        }
+        assert(close(fd) == 0);
+        assert(size > 0 && !memchr(text, 0, size));
+        text[size] = 0;
+        return text;
+}
+
+static EVP_PKEY *read_fixture_key(const char *path) {
+        char *text = read_fixture_input(path), group[32];
+        BIO *bio = BIO_new_mem_buf(text, (int) strlen(text));
+        EVP_PKEY_CTX *context;
+        EVP_PKEY *key;
+        size_t n;
+
+        assert(bio);
+        key = PEM_read_bio_PrivateKey(bio, NULL, NULL, (void *) "");
+        assert(key && EVP_PKEY_is_a(key, "EC") == 1);
+        assert(EVP_PKEY_get_utf8_string_param(key, OSSL_PKEY_PARAM_GROUP_NAME, group, sizeof group, &n) == 1);
+        assert(strcmp(group, "prime256v1") == 0);
+        context = EVP_PKEY_CTX_new(key, NULL);
+        assert(context && EVP_PKEY_private_check(context) == 1);
+        while (BIO_read(bio, group, 1) == 1)
+                assert(group[0] == ' ' || group[0] == '\t' || group[0] == '\r' || group[0] == '\n');
+        EVP_PKEY_CTX_free(context);
+        BIO_free(bio);
+        free(text);
+        return key;
+}
+
+static FILE *fixture_output(int dirfd, const char *name) {
+        int fd = openat(dirfd, name, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+        FILE *out;
+
+        assert(fd >= 0);
+        out = fdopen(fd, "w");
+        assert(out);
+        return out;
+}
+
+static void write_fixture_key(EVP_PKEY *key, const char *directory) {
+        uint8_t signer[34];
+        Buffer public = public_key(key, FAULT_NONE, signer);
+        char *ak = hex(public.data, public.size);
+        FILE *out;
+        int dirfd;
+
+        dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+        assert(dirfd >= 0);
+        out = fixture_output(dirfd, "key.pem");
+        assert(PEM_write_PrivateKey(out, key, NULL, NULL, 0, NULL, NULL) == 1);
+        assert(fclose(out) == 0);
+        out = fixture_output(dirfd, "ak.hex");
+        assert(fputs(ak, out) >= 0);
+        assert(fclose(out) == 0);
+        assert(close(dirfd) == 0);
+        free(ak);
+}
+
+static void write_fixture_full(EVP_PKEY *key, const char *directory, Fault fault, const FixtureRequest *request) {
+        Fixture f = fixture_new_full(key, 3, fault, request);
         char *text = NULL;
         const char *names[] = { "token.json", "ak.hex", "nonce.hex" };
         const char *values[3];
@@ -880,12 +1037,8 @@ static void write_fixture(EVP_PKEY *key, const char *directory, Fault fault) {
         dirfd = open(directory, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
         assert(dirfd >= 0);
         for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
-                int fd = openat(dirfd, names[i], O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-                FILE *out;
+                FILE *out = fixture_output(dirfd, names[i]);
 
-                assert(fd >= 0);
-                out = fdopen(fd, "w");
-                assert(out);
                 assert(fputs(values[i], out) >= 0);
                 assert(fclose(out) == 0);
         }
@@ -894,11 +1047,125 @@ static void write_fixture(EVP_PKEY *key, const char *directory, Fault fault) {
         fixture_done(&f);
 }
 
+static void write_fixture(EVP_PKEY *key, const char *directory, Fault fault) {
+        write_fixture_full(key, directory, fault, &default_request);
+}
+
+static void write_request_fixture(EVP_PKEY *key, const char *directory, const char *request_path) {
+        char *text = read_fixture_input(request_path);
+        sd_json_variant *value = NULL;
+        FixtureRequest request;
+
+        assert(sd_json_parse(text, 0, &value, NULL, NULL) >= 0);
+        assert(request_parse(value, &request));
+        write_fixture_full(key, directory, VALID_CONTEXT, &request);
+        sd_json_variant_unref(value);
+        free(text);
+}
+
+static void test_request_fixture(EVP_PKEY *key) {
+        static const char *const invalid[] = { "", "\n", "\x7f", "\xc3\xa9" };
+        static const char *const fields[] = { "challengeHex", "audience", "operationDigestHex" };
+        sd_json_variant *value = NULL, *context = NULL, *report = NULL, *copy = NULL, *number = NULL;
+        FixtureRequest request;
+        Fixture f;
+        char large[258];
+        char *text = NULL, *duplicate = NULL;
+
+        assert(sd_json_buildo(&context,
+                             SD_JSON_BUILD_PAIR_STRING("challengeHex", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+                             SD_JSON_BUILD_PAIR_STRING("audience", "https://verifier.example"),
+                             SD_JSON_BUILD_PAIR_STRING("operationDigestHex", "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc")) >= 0);
+        assert(sd_json_buildo(&value,
+                             SD_JSON_BUILD_PAIR_UNSIGNED("uid", 42),
+                             SD_JSON_BUILD_PAIR_STRING("sessionId", "request-session"),
+                             SD_JSON_BUILD_PAIR_VARIANT("context", context)) >= 0);
+        assert(request_parse(value, &request));
+        assert(request.uid == 42 && strcmp(request.session, "request-session") == 0);
+        f = fixture_new_full(key, 3, VALID_CONTEXT, &request);
+        assert(strcmp(f.nonce, request.challenge) == 0);
+        assert(attestation_verify(f.token, f.ak, request.challenge, &report) == 0);
+        for (size_t i = 0; i < 3; i++) {
+                sd_json_variant *record = NULL, *payload, *events = at(f.token, "measurements/2/events");
+                const char *description = sd_json_variant_string(at(sd_json_variant_by_index(events, i), "description"));
+
+                assert(sd_json_parse(description, 0, &record, NULL, NULL) >= 0);
+                payload = sd_json_variant_by_key(record, "payload");
+                assert(sd_json_variant_unsigned(sd_json_variant_by_key(payload, "uid")) == request.uid);
+                assert(strcmp(sd_json_variant_string(sd_json_variant_by_key(payload, "sessionId")), request.session) == 0);
+                assert(sd_json_variant_equal(sd_json_variant_by_key(payload, "context"), context));
+                sd_json_variant_unref(record);
+        }
+        fixture_done(&f);
+        assert(!request_parse(NULL, &request));
+        assert(!request_parse(context, &request));
+        assert(sd_json_variant_format(value, 0, &text) >= 0);
+        assert(asprintf(&duplicate, "%.*s,\"uid\":42}", (int) strlen(text) - 1, text) >= 0);
+        assert(sd_json_parse(duplicate, 0, &copy, NULL, NULL) >= 0);
+        assert(!request_parse(copy, &request));
+        copy = sd_json_variant_unref(copy);
+        free(duplicate);
+        free(text);
+        text = NULL;
+        assert(sd_json_variant_format(context, 0, &text) >= 0);
+        assert(asprintf(&duplicate, "%.*s,\"audience\":\"https://verifier.example\"}", (int) strlen(text) - 1, text) >= 0);
+        assert(sd_json_parse(duplicate, 0, &copy, NULL, NULL) >= 0);
+        assert(sd_json_variant_set_field(&value, "context", copy) >= 0);
+        assert(!request_parse(value, &request));
+        assert(sd_json_variant_set_field(&value, "context", context) >= 0);
+        copy = sd_json_variant_unref(copy);
+        free(duplicate);
+        free(text);
+        copy = sd_json_variant_ref(value);
+        assert(sd_json_variant_set_field_unsigned(&copy, "uid", UINT32_MAX) >= 0);
+        assert(!request_parse(copy, &request));
+        assert(sd_json_variant_set_field_unsigned(&copy, "uid", UINT32_MAX - 1) >= 0);
+        assert(request_parse(copy, &request));
+        assert(sd_json_variant_new_real(&number, 42.0) >= 0);
+        assert(sd_json_variant_set_field(&copy, "uid", number) >= 0);
+        assert(!request_parse(copy, &request));
+        sd_json_variant_unref(copy);
+        copy = sd_json_variant_ref(value);
+        assert(sd_json_variant_set_field_boolean(&copy, "extra", true) >= 0);
+        assert(!request_parse(copy, &request));
+        sd_json_variant_unref(copy);
+        memset(large, 'a', sizeof large - 1);
+        large[sizeof large - 1] = 0;
+        for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++)
+                for (size_t j = 0; j < sizeof invalid / sizeof invalid[0] + 1; j++) {
+                        sd_json_variant *bad_context = sd_json_variant_ref(context);
+
+                        copy = sd_json_variant_ref(value);
+                        assert(sd_json_variant_set_field_string(&bad_context, fields[i],
+                                                                j < sizeof invalid / sizeof invalid[0] ? invalid[j] : large) >= 0);
+                        assert(sd_json_variant_set_field(&copy, "context", bad_context) >= 0);
+                        assert(!request_parse(copy, &request));
+                        sd_json_variant_unref(bad_context);
+                        sd_json_variant_unref(copy);
+                }
+        for (size_t i = 0; i < sizeof invalid / sizeof invalid[0] + 1; i++) {
+                copy = sd_json_variant_ref(value);
+                assert(sd_json_variant_set_field_string(&copy, "sessionId",
+                                                        i < sizeof invalid / sizeof invalid[0] ? invalid[i] : large) >= 0);
+                assert(!request_parse(copy, &request));
+                sd_json_variant_unref(copy);
+        }
+        sd_json_variant_unref(number);
+        sd_json_variant_unref(report);
+        sd_json_variant_unref(context);
+        sd_json_variant_unref(value);
+}
+
 int main(int argc, char **argv) {
-        EVP_PKEY *key = EVP_PKEY_Q_keygen(NULL, NULL, "EC", "prime256v1");
+        bool request_fixture = argc == 5 && strcmp(argv[1], "--write-request-fixture") == 0;
+        EVP_PKEY *key = request_fixture ? read_fixture_key(argv[3]) : EVP_PKEY_Q_keygen(NULL, NULL, "EC", "prime256v1");
 
         assert(key);
-        if (argc == 3 && strcmp(argv[1], "--write-fixture") == 0)
+        if (request_fixture)
+                write_request_fixture(key, argv[2], argv[4]);
+        else if (argc == 3 && strcmp(argv[1], "--write-request-key") == 0)
+                write_fixture_key(key, argv[2]);
+        else if (argc == 3 && strcmp(argv[1], "--write-fixture") == 0)
                 write_fixture(key, argv[2], FAULT_NONE);
         else if (argc == 3 && strcmp(argv[1], "--write-context-fixture") == 0)
                 write_fixture(key, argv[2], VALID_CONTEXT);
@@ -938,6 +1205,7 @@ int main(int argc, char **argv) {
                 test_array_order(key);
                 test_json_bounds(key);
                 test_unsigned_assertions(key);
+                test_request_fixture(key);
                 printf("Accepted %u valid tokens; rejected %u invalid tokens.\n", accepted_tokens, rejected_tokens);
         }
         EVP_PKEY_free(key);

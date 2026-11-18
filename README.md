@@ -20,7 +20,7 @@ The build requires libsystemd 257 or newer, OpenSSL 3.0 or newer, Meson 1.1 or
 newer, Ninja, and a C11 compiler. TPM attestation additionally requires
 tss2-esys, tss2-mu, and tss2-tctildr. The PAM module requires libpam. Boot reference
 provisioning requires `systemd-measure`. Verifier-side enrollment requires
-`tpm2_makecredential`.
+`tpm2_makecredential`. Tests additionally require Python 3.
 
 ## Building
 

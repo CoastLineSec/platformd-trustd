@@ -52,7 +52,7 @@ jobs:
           }
           retry pacman -Sy --noconfirm --needed archlinux-keyring
           retry pacman -Syu --noconfirm --needed \
-            git base-devel meson ninja gperf python-jinja \
+            git base-devel meson ninja gperf python python-jinja \
             systemd pam openssl tpm2-tss dbus swtpm tpm2-tools \
             libxslt libxml2 docbook-xsl groff shellcheck actionlint
 
