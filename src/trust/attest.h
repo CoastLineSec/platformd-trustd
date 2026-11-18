@@ -39,18 +39,18 @@ int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
                       uint8_t **certify_info, size_t *certify_info_len,
                       uint8_t **sig, size_t *sig_len);
 
-/* Enrollment evidence for binding the AK to a genuine TPM: the EK public and (if
- * present in NV) its manufacturer certificate, plus the AK public and its TPM
- * name. All outputs are malloc'd (caller frees); ek_cert may be NULL. */
+/* Enrollment inputs: the EK public and optional certificate from NV, plus the
+ * AK public and its TPM name. The certificate is not validated here.
+ * All outputs are malloc'd (caller frees); ek_cert may be NULL. */
 int attest_get_enrollment(uint8_t **ek_pub, size_t *ek_pub_len,
                           uint8_t **ek_cert, size_t *ek_cert_len,
                           uint8_t **ak_pub, size_t *ak_pub_len,
                           uint8_t **ak_name, size_t *ak_name_len);
 
 /* Activate a credential a verifier made (TPM2_MakeCredential) for the AK's name
- * and the EK. It recovers the challenge only if the AK and EK are on this TPM,
- * proving the AK is genuine. cred/secret are the marshaled TPM2B_ID_OBJECT /
- * TPM2B_ENCRYPTED_SECRET. challenge is malloc'd. */
+ * and the EK. Activation binds the AK to the supplied EK; the verifier must
+ * establish trust in the EK separately. cred/secret are the marshaled
+ * TPM2B_ID_OBJECT / TPM2B_ENCRYPTED_SECRET. challenge is malloc'd. */
 int attest_activate_credential(const uint8_t *cred, size_t cred_len,
                                const uint8_t *secret, size_t secret_len,
                                uint8_t **challenge, size_t *challenge_len);

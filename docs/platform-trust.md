@@ -245,6 +245,12 @@ measurement log is not emitted as complete attestation evidence.
 
 ## Limitations
 
+`trustctl verify-attestation` verifies an evidence envelope offline against an
+independently supplied Attestation Key and expected challenge. Its JSON result
+reports cryptographic consistency, not enrollment, accepted boot state, or
+authentication freshness. The requester owns challenge expiry and single-use
+enforcement. See `trustctl(1)` for the input format and verification limits.
+
 Policy evaluation is local and reflects the evidence sources described above.
 A `verified-local` boot uses references stored on the same host. Session lock
 state depends on the desktop or locker maintaining logind `LockedHint`.

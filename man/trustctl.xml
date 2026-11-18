@@ -47,7 +47,8 @@
     root. The daemon restricts evidence production because it is a signing
     operation on the shared TPM. <command>provision</command> and
     <command>remove-boot-reference</command> require privilege to update boot
-    references.</para>
+    references. <command>verify-attestation</command> verifies supplied evidence
+    offline and requires neither privilege, a running daemon, nor a TPM.</para>
   </refsect1>
 
   <refsect1>
@@ -126,6 +127,33 @@
       </varlistentry>
 
       <varlistentry>
+        <term><command>verify-attestation</command> <replaceable>FILE</replaceable>
+        <option>--attestation-key=<replaceable>FILE</replaceable></option>
+        <option>--nonce=<replaceable>HEX</replaceable></option></term>
+        <listitem><para>Verify a version 2 platformd attestation envelope against
+        an independently supplied Attestation Key and challenge. The key file
+        contains the hexadecimal marshaled <constant>TPM2B_PUBLIC</constant>,
+        with optional surrounding whitespace. Both inputs must be regular
+        files; the envelope is limited to 16 MiB and the key file to 4096 bytes.
+        The challenge is required and must contain 1 through 64 bytes encoded
+        as hexadecimal.</para>
+
+        <para>Verify the quote and NV certification signatures, challenge,
+        signer and TPM lifecycle, quoted PCR digest, NV definition and value,
+        and exact runtime-log replay. Print the successful checks and retained
+        event count as JSON. No result is printed when verification fails.</para>
+
+        <para>Success establishes evidence integrity under the supplied key.
+        It does not establish key enrollment, approved boot state, complete
+        boot history, trusted timestamps, authentication freshness, or access
+        authorization. Local assertions remain unsigned. An empty retained
+        runtime log is valid only when its baseline equals the certified value;
+        it contains no authentication evidence. The requester must generate,
+        expire, and consume its challenges. Reusing a challenge is not detected
+        by this command.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><command>enroll</command></term>
         <listitem><para>Show the enrollment evidence: the Endorsement Key public
         key and, when present, its manufacturer certificate, together with the
@@ -138,7 +166,9 @@
         credential blob and encrypted secret produced by a verifier's
         <function>TPM2_MakeCredential</function> (both hexadecimal). The challenge
         is recovered only if the attestation key and the Endorsement Key are
-        resident on this TPM, which proves the attestation key genuine.</para></listitem>
+        resident together. The verifier must independently establish trust in
+        the Endorsement Key; credential activation alone does not establish
+        manufacturer provenance.</para></listitem>
       </varlistentry>
 
       <varlistentry>

@@ -8,7 +8,7 @@ The package provides:
 
 * `platformd-trustd`, the system service and `io.platformd.Trust` Varlink
   interface
-* `trustctl`, the command line client
+* `trustctl`, the command line client and offline attestation verifier
 * `pam_platformd.so`, a PAM module for submitting session records and evaluating
   trust policies
 
@@ -49,8 +49,10 @@ Verification freshness is established only by an accepted successful
 unlock notifications, and records submitted by `pam_platformd.so` do not
 establish freshness.
 
-Attestation is unavailable when the package is built without TPM2-TSS or the
-system has no usable TPM. Authentication events remain declared evidence even
+Attestation production is unavailable when the package is built without TPM2-TSS
+or the system has no usable TPM. Offline verification requires an independently
+supplied attestation key and challenge, but no TPM or running service.
+Authentication events remain declared evidence even
 when they are included in a TPM protected runtime measurement log.
 
 The runtime log requires explicit NV index initialization. Attestation uses a

@@ -1764,7 +1764,7 @@ static int vl_get_attestation_token_run(sd_varlink *link, sd_json_variant *param
         return backend_reply(link, result);
 }
 
-/* --- AK enrollment: bind the attestation key to a genuine TPM ----------------- */
+/* --- Attestation enrollment inputs and credential activation ---------------- */
 
 static int vl_get_enrollment_run(sd_varlink *link, sd_json_variant *parameters,
                              sd_varlink_method_flags_t flags, void *userdata) {

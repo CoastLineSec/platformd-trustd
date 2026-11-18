@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 
+libcrypto = dependency('libcrypto', version : '>= 3.0')
+
 trustctl = executable(
         'trustctl',
-        'trustctl.c', 'pe.c',
-        dependencies : libsystemd,
+        'trustctl.c', 'pe.c', 'attestation-verify.c',
+        dependencies : [libsystemd, libcrypto],
         install : true,
 )
 
@@ -11,8 +13,6 @@ trustctl = executable(
 tss2_esys = dependency('tss2-esys', required : false)
 tss2_mu = dependency('tss2-mu', required : false)
 tss2_tctildr = dependency('tss2-tctildr', required : false)
-# libcrypto verifies signed systemd-homed user records.
-libcrypto = dependency('libcrypto', version : '>= 3.0')
 have_tpm2 = tss2_esys.found() and tss2_mu.found() and tss2_tctildr.found()
 attest_src = have_tpm2 ? 'attest.c' : 'attest-stub.c'
 trustd_deps = have_tpm2 ? [libsystemd, tss2_esys, tss2_mu, tss2_tctildr, libcrypto] : [libsystemd, libcrypto]
@@ -112,7 +112,16 @@ test('environment', find_program('sh'),
      timeout : 60)
 
 test('pe', executable('test-pe', 'test-pe.c', 'pe.c'))
-test_provision = executable('test-provision', 'test-provision.c', 'pe.c', dependencies : libsystemd)
+test_attestation_verify = executable(
+        'test-attestation-verify', 'test-attestation-verify.c', 'attestation-verify.c',
+        dependencies : [libsystemd, libcrypto],
+)
+test('attestation-verify', test_attestation_verify)
+test('attestation-cli', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-attestation-cli.sh', trustctl, test_attestation_verify],
+     timeout : 60)
+test_provision = executable('test-provision', 'test-provision.c', 'pe.c', 'attestation-verify.c',
+                            dependencies : [libsystemd, libcrypto])
 test('provision', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_provision], timeout : 60)
 test('kernel-install', find_program('sh'),

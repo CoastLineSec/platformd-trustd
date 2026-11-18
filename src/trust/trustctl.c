@@ -21,6 +21,7 @@
 #include <systemd/sd-varlink.h>
 
 #include "pe.h"
+#include "attestation-verify.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -367,6 +368,111 @@ static int cmd_attest_token(const char *nonce_arg) {
         return EXIT_SUCCESS;
 }
 
+static int read_attestation_file(const char *path, size_t limit, char **ret) {
+        _cleanup_free_ char *buffer = NULL;
+        struct stat st;
+        size_t size, offset = 0;
+        int fd, r = 0;
+        char extra;
+        ssize_t n;
+
+        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        if (fd < 0)
+                return -errno;
+        if (fstat(fd, &st) < 0) {
+                r = -errno;
+                goto finish;
+        }
+        if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uintmax_t) st.st_size > limit) {
+                r = -EINVAL;
+                goto finish;
+        }
+        size = (size_t) st.st_size;
+        buffer = malloc(size + 1);
+        if (!buffer) {
+                r = -ENOMEM;
+                goto finish;
+        }
+        while (offset < size) {
+                n = read(fd, buffer + offset, size - offset);
+                if (n < 0 && errno == EINTR)
+                        continue;
+                if (n <= 0) {
+                        r = n < 0 ? -errno : -EIO;
+                        goto finish;
+                }
+                offset += (size_t) n;
+        }
+        do
+                n = read(fd, &extra, 1);
+        while (n < 0 && errno == EINTR);
+        if (n != 0) {
+                r = n < 0 ? -errno : -EFBIG;
+                goto finish;
+        }
+        if (memchr(buffer, 0, size)) {
+                r = -EBADMSG;
+                goto finish;
+        }
+        buffer[size] = 0;
+        *ret = buffer;
+        buffer = NULL;
+finish:
+        close(fd);
+        return r;
+}
+
+static int cmd_verify_attestation(int argc, char **argv) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *token = NULL, *report = NULL;
+        _cleanup_free_ char *text = NULL, *key_text = NULL;
+        const char *path = NULL, *key_path = NULL, *nonce = NULL;
+        char *key, *end;
+        int r;
+
+        for (int i = 0; i < argc; i++)
+                if (strncmp(argv[i], "--attestation-key=", 18) == 0 && !key_path)
+                        key_path = argv[i] + 18;
+                else if (strncmp(argv[i], "--nonce=", 8) == 0 && !nonce)
+                        nonce = argv[i] + 8;
+                else if (argv[i][0] != '-' && !path)
+                        path = argv[i];
+                else {
+                        fprintf(stderr, "trustctl: unknown or repeated verification argument\n");
+                        return EXIT_FAILURE;
+                }
+        if (!path || !key_path || !*key_path || !nonce || !*nonce) {
+                fprintf(stderr, "trustctl: verification requires a token file, --attestation-key=FILE, and --nonce=HEX\n");
+                return EXIT_FAILURE;
+        }
+        r = read_attestation_file(path, ATTESTATION_TOKEN_SIZE_MAX, &text);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: cannot read attestation: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        r = read_attestation_file(key_path, 4096, &key_text);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: cannot read attestation key: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        key = key_text;
+        while (isspace((unsigned char) *key))
+                key++;
+        end = key + strlen(key);
+        while (end > key && isspace((unsigned char) end[-1]))
+                *--end = 0;
+        r = sd_json_parse(text, 0, &token, NULL, NULL);
+        if (r >= 0)
+                r = attestation_verify(token, key, nonce, &report);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: attestation verification failed: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        if (r < 0 || fflush(stdout) != 0)
+                return EXIT_FAILURE;
+        return EXIT_SUCCESS;
+}
+
 static int cmd_enroll(void) {
         _cleanup_(sd_varlink_unrefp) sd_varlink *link = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *reply = NULL;
@@ -378,7 +484,7 @@ static int cmd_enroll(void) {
                 return EXIT_FAILURE;
         printf("ek-public: %s\n", jstr(reply, "ekPublicHex"));
         cert = jstr(reply, "ekCertHex");
-        printf("ek-cert  : %s\n", *cert ? cert : "(none in NV; firmware TPM)");
+        printf("ek-cert  : %s\n", *cert ? cert : "(none in NV)");
         printf("ak-public: %s\n", jstr(reply, "akPublicHex"));
         printf("ak-name  : %s\n", jstr(reply, "akNameHex"));
         return EXIT_SUCCESS;
@@ -705,6 +811,8 @@ static void usage(void) {
                "  trustctl pcrs                     TPM PCR bank (measured boot)\n"
                "  trustctl attest [nonceHex]        Produce a TPM quote (attestation)\n"
                "  trustctl attest-token [nonceHex]  Platformd attestation evidence envelope\n"
+               "  trustctl verify-attestation FILE --attestation-key=FILE --nonce=HEX\n"
+               "                                  Verify evidence against an expected key and challenge\n"
                "  trustctl enroll                   EK/AK enrollment evidence (credential activation)\n"
                "  trustctl activate-credential <cred> <secret>  Answer a MakeCredential challenge\n"
                "  trustctl list-sessions            All tracked logind sessions\n"
@@ -742,6 +850,8 @@ int main(int argc, char *argv[]) {
                 return cmd_attest(argc > 2 ? argv[2] : NULL);
         if (streq(cmd, "attest-token"))
                 return cmd_attest_token(argc > 2 ? argv[2] : NULL);
+        if (streq(cmd, "verify-attestation"))
+                return cmd_verify_attestation(argc - 2, argv + 2);
         if (streq(cmd, "enroll"))
                 return cmd_enroll();
         if (streq(cmd, "activate-credential") && argc > 3)
