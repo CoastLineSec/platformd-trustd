@@ -31,6 +31,7 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
  * value_out is 32 bytes; certification outputs are malloc'd. */
 int attest_nv_read(uint8_t value_out[32]);
 int attest_nv_initialize(void);
+int attest_nv_prepare(void);
 int attest_nv_public(uint8_t **ret, size_t *ret_size);
 int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]);
 int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,

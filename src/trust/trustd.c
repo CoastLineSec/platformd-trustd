@@ -2011,6 +2011,11 @@ static int backend_run(void *userdata, sd_json_variant **ret) {
                 m->backend_result = NULL;
                 return r;
         }
+        if (!q->event) {
+                r = attest_nv_prepare();
+                if (r < 0)
+                        return r;
+        }
         r = attest_nv_read(value);
         if (r < 0)
                 return r;

@@ -157,7 +157,7 @@ test('runtime-event', executable('test-runtime-event', 'test-runtime-event.c', '
 test('runtime-log', executable('test-runtime-log',
         'test-runtime-log.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : [libsystemd, libcrypto],
-        link_args : ['-Wl,--wrap=attest_nv_read', '-Wl,--wrap=attest_nv_extend']))
+        link_args : ['-Wl,--wrap=attest_nv_prepare', '-Wl,--wrap=attest_nv_read', '-Wl,--wrap=attest_nv_extend']))
 test('verification-event', executable('test-verification-event',
         'test-verification-event.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : [libsystemd, libcrypto],
@@ -195,9 +195,15 @@ test_suspend = executable('test-suspend',
         ])
 test('suspend', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_suspend])
 if have_tpm2
-        test_attest = executable('test-attest', 'test-attest.c', 'attest.c', 'runtime-event.c', dependencies : trustd_deps)
+        test_attest = executable('test-attest', 'test-attest.c', 'attest.c', 'runtime-event.c', dependencies : trustd_deps,
+                                 link_args : ['-Wl,--wrap=Esys_NV_Extend', '-Wl,--wrap=Esys_NV_Read'])
         test('attest', find_program('sh'),
              args : [meson.current_source_dir() / 'test-attest.sh', test_attest], timeout : 60)
+        test_attest_startup = executable('test-attest-startup',
+                'test-attest-startup.c', 'attest.c', 'attestation-verify.c', 'runtime-event.c',
+                'trust-util.c', 'verify.c', 'worker.c', dependencies : trustd_deps)
+        test('attest-startup', find_program('sh'),
+             args : [meson.current_source_dir() / 'test-attest-startup.sh', test_attest_startup], timeout : 60)
 endif
 test('verify', executable('test-verify', 'test-verify.c', 'verify.c',
      dependencies : [libsystemd, libcrypto]))

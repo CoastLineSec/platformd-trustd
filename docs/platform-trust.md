@@ -199,6 +199,15 @@ never create an index. The administrative command
 a conflicting definition. It does not replace or delete an existing index.
 Restart the service after initializing the index.
 
+At startup, the service prepares an existing index whose `TPMA_NV_WRITTEN` bit
+is clear. It extends `SHA256("io.platformd.Trust.RuntimeLog.v2:initial")`, using
+the ASCII string without a terminating NUL. The initial baseline is
+`SHA256(32 zero bytes || seedDigest)`, where `seedDigest` is that string's
+SHA-256 digest. Explicit initialization uses the same baseline. A written index
+retains its current value. Startup preparation does not create an index, record
+authentication, or establish freshness. Runtime-log queries and certification
+remain read-only.
+
 The runtime log format is `io.platformd.Trust.RuntimeLog.v2`. Each event's
 `description` contains the exact compact JSON record measured by the service.
 Its `format` is `io.platformd.Trust.RuntimeEvent.v2`. The record includes the

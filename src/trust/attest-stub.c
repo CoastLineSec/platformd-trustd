@@ -8,6 +8,10 @@ int attest_nv_initialize(void) {
         return -ENOTSUP;
 }
 
+int attest_nv_prepare(void) {
+        return -ENOTSUP;
+}
+
 int attest_nv_public(uint8_t **ret, size_t *ret_size) {
         *ret = NULL;
         *ret_size = 0;

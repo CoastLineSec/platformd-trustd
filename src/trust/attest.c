@@ -8,6 +8,7 @@
 #include <string.h>
 #include <unistd.h>
 
+#include <openssl/evp.h>
 #include <tss2/tss2_esys.h>
 #include <tss2/tss2_mu.h>
 #include <tss2/tss2_tctildr.h>
@@ -199,7 +200,7 @@ out:
 
 #define TRUSTD_NV_INDEX 0x01800001u
 
-static int nv_open(ESYS_CONTEXT *ctx, ESYS_TR *nv, bool initialize) {
+static int nv_open(ESYS_CONTEXT *ctx, ESYS_TR *nv, bool initialize, bool *ret_written) {
         static const TPM2B_AUTH empty = { .size = 0 };
         static const TPM2B_NV_PUBLIC expected = {
                 .nvPublic = {
@@ -232,26 +233,59 @@ static int nv_open(ESYS_CONTEXT *ctx, ESYS_TR *nv, bool initialize) {
             public->nvPublic.nameAlg == expected.nvPublic.nameAlg &&
             public->nvPublic.dataSize == expected.nvPublic.dataSize &&
             public->nvPublic.authPolicy.size == 0 &&
-            (public->nvPublic.attributes & ~TPMA_NV_WRITTEN) == expected.nvPublic.attributes)
+            (public->nvPublic.attributes & ~TPMA_NV_WRITTEN) == expected.nvPublic.attributes) {
+                if (ret_written)
+                        *ret_written = (public->nvPublic.attributes & TPMA_NV_WRITTEN) != 0;
                 r = 0;
-        else
+        } else
                 r = -EKEYREJECTED;
         Esys_Free(public);
         return r;
 }
 
-int attest_nv_initialize(void) {
+static int nv_prepare(bool initialize) {
+        static const char seed[] = "io.platformd.Trust.RuntimeLog.v2:initial";
         ESYS_CONTEXT *context = NULL;
         TSS2_TCTI_CONTEXT *tcti = NULL;
         ESYS_TR nv = ESYS_TR_NONE;
+        TPM2B_MAX_NV_BUFFER in = { .size = 32 }, *value = NULL;
+        uint8_t input[64] = {}, expected[32];
+        bool written;
         int r;
 
         r = esys_initialize(&context, &tcti);
         if (r < 0)
                 return r;
-        r = nv_open(context, &nv, true);
+        r = nv_open(context, &nv, initialize, &written);
+        if (r < 0)
+                goto finish;
+        r = -EIO;
+        if (!written) {
+                if (EVP_Q_digest(NULL, "SHA256", NULL, seed, sizeof seed - 1, input + 32, NULL) != 1 ||
+                    EVP_Q_digest(NULL, "SHA256", NULL, input, sizeof input, expected, NULL) != 1)
+                        goto finish;
+                memcpy(in.buffer, input + 32, in.size);
+                if (Esys_NV_Extend(context, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE,
+                                   ESYS_TR_NONE, &in) != TSS2_RC_SUCCESS)
+                        goto finish;
+        }
+        if (Esys_NV_Read(context, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
+                         32, 0, &value) != TSS2_RC_SUCCESS || !value || value->size != 32 ||
+            (!written && memcmp(value->buffer, expected, sizeof expected) != 0))
+                goto finish;
+        r = 0;
+finish:
+        Esys_Free(value);
         esys_finalize(&context, &tcti);
         return r;
+}
+
+int attest_nv_initialize(void) {
+        return nv_prepare(true);
+}
+
+int attest_nv_prepare(void) {
+        return nv_prepare(false);
 }
 
 int attest_nv_public(uint8_t **ret, size_t *ret_size) {
@@ -268,7 +302,7 @@ int attest_nv_public(uint8_t **ret, size_t *ret_size) {
         r = esys_initialize(&context, &tcti);
         if (r < 0)
                 return r;
-        r = nv_open(context, &nv, false);
+        r = nv_open(context, &nv, false, NULL);
         if (r < 0)
                 goto finish;
         r = -EIO;
@@ -295,7 +329,7 @@ int attest_nv_read(uint8_t value_out[32]) {
         if ((r = esys_initialize(&ctx, &tcti)) < 0)
                 return r;
         r = -EIO;
-        if ((r = nv_open(ctx, &nv, false)) < 0)
+        if ((r = nv_open(ctx, &nv, false, NULL)) < 0)
                 goto out;
         rc = Esys_NV_Read(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE,
                           32, 0, &data);
@@ -327,7 +361,7 @@ int attest_nv_extend(const uint8_t *data, size_t len, uint8_t value_out[32]) {
         if ((r = esys_initialize(&ctx, &tcti)) < 0)
                 return r;
         r = -EIO;
-        if ((r = nv_open(ctx, &nv, false)) < 0)
+        if ((r = nv_open(ctx, &nv, false, NULL)) < 0)
                 goto out;
         r = -EIO;
         if (Esys_NV_Extend(ctx, ESYS_TR_RH_OWNER, nv, ESYS_TR_PASSWORD, ESYS_TR_NONE, ESYS_TR_NONE, &in) != TSS2_RC_SUCCESS)
@@ -366,7 +400,7 @@ int attest_nv_certify(const uint8_t *nonce, size_t nonce_len,
         if ((r = esys_initialize(&ctx, &tcti)) < 0)
                 return r;
         r = -EIO;
-        if ((r = nv_open(ctx, &nv, false)) < 0)
+        if ((r = nv_open(ctx, &nv, false, NULL)) < 0)
                 goto out;
         r = -EIO;
         if (create_primary(ctx, ESYS_TR_RH_OWNER, &ak_template, &ak, &ak_public, NULL) < 0)

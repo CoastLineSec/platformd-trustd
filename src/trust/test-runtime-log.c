@@ -11,9 +11,16 @@
 
 static uint8_t nv_value[32];
 static bool read_error, extend_error, corrupt_extend;
-static unsigned extensions;
+static unsigned extensions, preparations, reads;
+static int prepare_error;
+
+int __wrap_attest_nv_prepare(void) {
+        preparations++;
+        return prepare_error;
+}
 
 int __wrap_attest_nv_read(uint8_t ret[32]) {
+        reads++;
         if (read_error)
                 return -EIO;
         memcpy(ret, nv_value, 32);
@@ -122,11 +129,13 @@ int main(void) {
         request = calloc(1, sizeof *request);
         assert(request);
         complete(&manager, request, 0);
-        assert(extensions == 0);
+        assert(extensions == 0 && preparations == 1);
+        assert(!manager.events && !manager.runtime_log && manager.n_runtime == 0);
         check_log(&manager, true);
         for (unsigned i = 0; i < RUNTIME_LOG_MAX + 3; i++)
                 append(&manager, i, 0);
         assert(manager.n_runtime == RUNTIME_LOG_MAX);
+        assert(preparations == 1);
         check_log(&manager, true);
 
         before = extensions;
@@ -139,6 +148,7 @@ int main(void) {
         request = calloc(1, sizeof *request);
         assert(request);
         complete(&manager, request, 0);
+        assert(preparations == 2);
         check_log(&manager, true);
         read_error = true;
         append(&manager, 2001, -EIO);
@@ -152,5 +162,22 @@ int main(void) {
         corrupt_extend = false;
         check_log(&manager, false);
         clear(&manager);
+
+        const int errors[] = { -ENOENT, -EKEYREJECTED, -EACCES, -EIO };
+        for (size_t i = 0; i < sizeof errors / sizeof errors[0]; i++) {
+                sd_json_variant *error;
+
+                prepare_error = errors[i];
+                before = reads;
+                request = calloc(1, sizeof *request);
+                assert(request);
+                complete(&manager, request, errors[i]);
+                assert(reads == before && manager.runtime_log_incomplete);
+                assert(!manager.events && !manager.runtime_log && manager.n_runtime == 0);
+                assert(vl_get_attestation_token_run(NULL, NULL, 0, &manager) >= 0);
+                error = sd_json_variant_by_key(manager.backend_result, "error");
+                assert(strcmp(sd_json_variant_string(error), "io.platformd.Trust.AttestationFailed") == 0);
+                clear(&manager);
+        }
         return 0;
 }
