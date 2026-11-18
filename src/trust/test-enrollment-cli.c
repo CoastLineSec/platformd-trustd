@@ -4,18 +4,29 @@
 #include <assert.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <systemd/sd-id128.h>
 #include <systemd/sd-varlink.h>
 #include <openssl/evp.h>
 
+#include "attestation-request.h"
+
 static int test_fstat(int fd, struct stat *ret);
 static int test_connect(sd_varlink **ret, const char *address);
+static int test_appraise_request(sd_json_variant *token, const char *expected_ak_hex,
+                                 sd_json_variant *request, sd_json_variant *reference, const char *phase,
+                                 sd_json_variant **ret_report);
+static int test_format(sd_json_variant *v, sd_json_format_flags_t flags, char **ret);
 
 #define fstat test_fstat
 #define sd_varlink_connect_address test_connect
+#define attestation_appraise_request test_appraise_request
+#define sd_json_variant_format test_format
 #define main trustctl_main
 #include "trustctl.c"
 #undef main
+#undef sd_json_variant_format
+#undef attestation_appraise_request
 #undef sd_varlink_connect_address
 #undef fstat
 
@@ -39,7 +50,59 @@ typedef struct Fixture {
 } Fixture;
 
 static bool wrong_response_owner;
+static enum {
+        REQUEST_CLOCK_NONE,
+        REQUEST_CLOCK_APPRAISED,
+        REQUEST_CLOCK_FORMATTED,
+        REQUEST_CLOCK_FAILED,
+        REQUEST_CLOCK_BEFORE_DEADLINE,
+} request_clock;
+static uint64_t fixed_boottime_usec, request_deadline_usec;
+static bool request_appraised, request_formatted, fail_clock;
 static unsigned checks;
+
+int __real_clock_gettime(clockid_t clock, struct timespec *ret);
+int __wrap_clock_gettime(clockid_t clock, struct timespec *ret);
+
+int __wrap_clock_gettime(clockid_t clock, struct timespec *ret) {
+        if (clock != CLOCK_BOOTTIME || fixed_boottime_usec == 0)
+                return __real_clock_gettime(clock, ret);
+        if (fail_clock) {
+                errno = EIO;
+                return -1;
+        }
+        ret->tv_sec = (time_t) (fixed_boottime_usec / 1000000);
+        ret->tv_nsec = (long) (fixed_boottime_usec % 1000000) * 1000;
+        return 0;
+}
+
+static int test_appraise_request(sd_json_variant *token, const char *expected_ak_hex,
+                                 sd_json_variant *request, sd_json_variant *reference, const char *phase,
+                                 sd_json_variant **ret_report) {
+        int r = attestation_appraise_request(token, expected_ak_hex, request, reference, phase, ret_report);
+
+        if (r >= 0) {
+                request_appraised = true;
+                if (request_clock == REQUEST_CLOCK_APPRAISED)
+                        fixed_boottime_usec = request_deadline_usec;
+        }
+        return r;
+}
+
+static int test_format(sd_json_variant *v, sd_json_format_flags_t flags, char **ret) {
+        int r = sd_json_variant_format(v, flags, ret);
+
+        if (r >= 0 && request_appraised) {
+                request_formatted = true;
+                if (request_clock == REQUEST_CLOCK_FORMATTED)
+                        fixed_boottime_usec = request_deadline_usec;
+                else if (request_clock == REQUEST_CLOCK_BEFORE_DEADLINE)
+                        fixed_boottime_usec = request_deadline_usec - 1;
+                else if (request_clock == REQUEST_CLOCK_FAILED)
+                        fail_clock = true;
+        }
+        return r;
+}
 
 static int test_fstat(int fd, struct stat *ret) {
         int r = fstat(fd, ret);
@@ -218,6 +281,8 @@ static sd_json_variant *run(Fixture *f, const char *command, char *const argumen
                 close(errfd);
                 alarm(5);
                 result = trustctl_main((int) count + 2, argv);
+                if (request_clock != REQUEST_CLOCK_NONE)
+                        assert(request_appraised && request_formatted);
                 assert(fflush(NULL) == 0);
                 _exit(result);
         }
@@ -501,6 +566,36 @@ static void test_request_files(Fixture *f) {
                 }
 }
 
+static void test_request_expiry(Fixture *f) {
+        char *args[] = { f->id, f->state_option, (char *) "--request-id=" CHALLENGE,
+                        f->token_option, f->reference_option, (char *) "--phase=" PHASE,
+                        (char *) "--allow-root-declared-authentication", NULL };
+
+        for (unsigned mode = REQUEST_CLOCK_APPRAISED; mode <= REQUEST_CLOCK_BEFORE_DEADLINE; mode++) {
+                sd_json_variant *v, *record;
+                char *text;
+
+                request_clock = mode;
+                fixed_boottime_usec = UINT64_C(100000000);
+                request_deadline_usec = fixed_boottime_usec + 600000000;
+                write_record(f, false, true);
+                v = run(f, "request-complete", args, mode == REQUEST_CLOCK_BEFORE_DEADLINE);
+                if (v)
+                        assert(jbool(v, "singleUseChallengeConsumed") && jbool(v, "authenticationDeclarationMatched"));
+                sd_json_variant_unref(v);
+                request_clock = REQUEST_CLOCK_NONE;
+                fixed_boottime_usec = 0;
+                text = read_file(f->record);
+                record = parse(text);
+                assert(sd_json_variant_is_null(sd_json_variant_by_key(record, "request")));
+                assert(juint(record, "generation") == 2);
+                sd_json_variant_unref(record);
+                reject(f, "request-complete", args);
+                unchanged(f, text);
+                free(text);
+        }
+}
+
 static void test_missing_state(Fixture *f) {
         char option[PATH_MAX + 32];
         char *status_args[] = { f->id, option, NULL };
@@ -605,6 +700,7 @@ int main(int argc, char **argv) {
         test_response(&f);
         test_lifetime(&f);
         test_requests(&f);
+        test_request_expiry(&f);
         test_request_files(&f);
         test_missing_state(&f);
 

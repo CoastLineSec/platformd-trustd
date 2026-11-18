@@ -498,7 +498,7 @@ static int cmd_enrollment(const char *command, int argc, char **argv) {
         const char *options[_OPTION_MAX] = {}, *argument = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *input = NULL, *reference = NULL, *request = NULL, *report = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *endorsement = NULL;
-        _cleanup_free_ char *text = NULL, *key = NULL, *reference_text = NULL;
+        _cleanup_free_ char *text = NULL, *key = NULL, *reference_text = NULL, *output = NULL;
         char *response = NULL;
         Enrollment *enrollment = NULL;
         unsigned allowed = 1U << STATE, required, seen = 0;
@@ -609,7 +609,13 @@ finish:
                 explicit_bzero(response, strlen(response));
                 free(response);
         }
-        if (r >= 0)
+        if (r >= 0 && enrollment) {
+                r = sd_json_variant_format(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, &output);
+                if (r >= 0)
+                        r = enrollment_request_validate(enrollment);
+                if (r >= 0 && fputs(output, stdout) == EOF)
+                        r = -EIO;
+        } else if (r >= 0)
                 r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
         if (r >= 0 && fflush(stdout) != 0)
                 r = -EIO;

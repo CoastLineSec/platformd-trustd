@@ -352,7 +352,10 @@
         evidence under the active enrollment. Consumption is durable before
         appraisal; malformed evidence, an unapproved reference, or a missing
         authentication declaration cannot be retried with the same request.
-        A verifier reboot, expiry, or revocation invalidates the request.</para>
+        A verifier reboot, expiry, or revocation invalidates the request.
+        The verifier checks expiry again after appraisal and report formatting,
+        before writing a successful result. Expiry during processing consumes
+        the request without returning a result.</para>
 
         <para>Require valid TPM evidence, the request challenge in both TPM
         structures, approved PCR 11 for the selected phase, and an exact

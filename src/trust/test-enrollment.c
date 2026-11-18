@@ -51,6 +51,7 @@ static int default_helper_mode;
 static int crash_sync;
 static bool wrong_file_owner;
 static int64_t boottime_offset;
+static uint64_t fixed_boottime_usec;
 static unsigned assertions;
 
 static ssize_t test_getrandom(void *buffer, size_t size, unsigned flags) {
@@ -69,6 +70,11 @@ static int test_clock_gettime(clockid_t clock, struct timespec *ret) {
         if (fail_clock && clock != CLOCK_MONOTONIC) {
                 errno = 0;
                 return -1;
+        }
+        if (clock == CLOCK_BOOTTIME && fixed_boottime_usec > 0) {
+                ret->tv_sec = (time_t) (fixed_boottime_usec / 1000000);
+                ret->tv_nsec = (long) (fixed_boottime_usec % 1000000) * 1000;
+                return 0;
         }
         r = clock_gettime(clock, ret);
         if (r == 0 && clock == CLOCK_BOOTTIME)
@@ -734,6 +740,60 @@ static void test_request_failures(TestIdentity *identity) {
         assertions += 16;
 }
 
+static void test_consumed_request_expiry(TestIdentity *identity) {
+        const uint64_t created = UINT64_C(100000000);
+
+        assert(enrollment_request_validate(NULL) == -EINVAL);
+        assertions++;
+        for (unsigned fault = 0; fault < 5; fault++) {
+                char *directory = directory_make();
+                sd_json_variant *context = context_make(), *request = NULL, *inner = NULL;
+                Enrollment *e = NULL;
+                const char *id;
+
+                activate(directory, identity);
+                assert(enrollment_acquire(directory, identity->id, &e) == 0);
+                assert(enrollment_request_validate(e) == -EINVAL);
+                enrollment_release(e);
+                e = NULL;
+                fixed_boottime_usec = created;
+                assert(enrollment_request_begin(directory, identity->id, context, 1, &request) == 0);
+                id = string_field(request, "requestId");
+                assert(enrollment_request_consume(directory, identity->id, id, &e, &inner) == 0);
+                assert(enrollment_request_validate(e) == 0);
+                fixed_boottime_usec = created + 1000000 - 1;
+                assert(enrollment_request_validate(e) == 0);
+                if (fault == 0)
+                        fixed_boottime_usec++;
+                else if (fault == 1)
+                        fixed_boottime_usec += 2;
+                else if (fault == 2)
+                        fixed_boottime_usec = created - 1;
+                else if (fault == 3)
+                        change_boot = true;
+                else
+                        fail_clock = true;
+                assert(enrollment_request_validate(e) == (fault == 4 ? -EIO : -ETIMEDOUT));
+                enrollment_release(e);
+                e = NULL;
+                inner = sd_json_variant_unref(inner);
+                change_boot = fail_clock = false;
+                fixed_boottime_usec = created;
+                assert(enrollment_request_consume(directory, identity->id, id, &e, &inner) == -ENODATA && !e && !inner);
+                request = sd_json_variant_unref(request);
+                assert(enrollment_request_begin(directory, identity->id, context, 1, &request) == 0);
+                assert(enrollment_request_consume(directory, identity->id, string_field(request, "requestId"), &e, &inner) == 0);
+                assert(enrollment_request_validate(e) == 0);
+                enrollment_release(e);
+                sd_json_variant_unref(inner);
+                sd_json_variant_unref(request);
+                sd_json_variant_unref(context);
+                fixed_boottime_usec = 0;
+                directory_remove(directory);
+                assertions += 11;
+        }
+}
+
 static void test_request_concurrency(TestIdentity *identity) {
         for (int mode = 0; mode < 3; mode++) {
                 char *directory = directory_make();
@@ -856,6 +916,7 @@ int main(void) {
         test_requests(&identity);
         test_request_expiry(&identity);
         test_request_failures(&identity);
+        test_consumed_request_expiry(&identity);
         test_request_concurrency(&identity);
         test_crash_commit(&identity);
         test_restrictive_umask(&identity);

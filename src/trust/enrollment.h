@@ -30,3 +30,6 @@ int enrollment_request_begin(const char *state_dir, const char *key_id, sd_json_
  * remain held through appraisal. Consumption alone does not establish authentication. */
 int enrollment_request_consume(const char *state_dir, const char *key_id, const char *request_id,
                                Enrollment **ret_enrollment, sd_json_variant **ret_request);
+/* Recheck the consumed request's lifetime after appraisal, before emitting its result.
+ * Success is a snapshot and does not extend the request deadline. */
+int enrollment_request_validate(const Enrollment *enrollment);

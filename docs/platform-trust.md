@@ -315,7 +315,10 @@ invalidation. The application must explicitly accept root-declared PAM evidence.
 The unpredictable challenge and verifier-owned expiry establish the request
 window; device clocks do not. A failed appraisal consumes the request as well.
 Restarting the verifier's process retains state; rebooting invalidates pending
-requests. Revocation invalidates outstanding requests.
+requests. Revocation invalidates outstanding requests. The verifier checks the
+request deadline again after appraisal and report formatting, before emitting
+success. Expiry during processing consumes the request without producing a
+successful result. This check is a snapshot, not a guarantee of delivery time.
 
 The result is not a bearer credential or an authorization decision. The remote
 service owns authenticated transport, account-to-device mapping, approved

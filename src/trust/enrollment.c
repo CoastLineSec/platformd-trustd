@@ -77,6 +77,9 @@ struct Enrollment {
         int directory_fd;
         int lock_fd;
         EnrollmentRecord record;
+        char consumed_boot_id[SD_ID128_STRING_MAX];
+        uint64_t consumed_created_usec;
+        uint64_t consumed_deadline_usec;
 };
 
 static const char * const state_names[] = { "inactive", "pending", "active", "revoked" };
@@ -1400,6 +1403,9 @@ int enrollment_request_consume(const char *state_dir, const char *key_id, const 
                 r = request_format(&e->record.request, &request);
                 if (r < 0)
                         goto finish;
+                strcpy(e->consumed_boot_id, e->record.request.boot_id);
+                e->consumed_created_usec = e->record.request.created_usec;
+                e->consumed_deadline_usec = e->record.request.deadline_usec;
         }
         e->record.request = (AuthenticationRequest) {};
         e->record.generation++;
@@ -1418,4 +1424,13 @@ finish:
         sd_json_variant_unref(request);
         enrollment_release(e);
         return r;
+}
+
+int enrollment_request_validate(const Enrollment *e) {
+        int r;
+
+        if (!e || e->record.state != ENROLLMENT_ACTIVE || !e->consumed_boot_id[0])
+                return -EINVAL;
+        r = deadline_valid(e->consumed_boot_id, e->consumed_created_usec, e->consumed_deadline_usec);
+        return r < 0 ? r : r > 0 ? 0 : -ETIMEDOUT;
 }

@@ -144,6 +144,7 @@ test('enrollment', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_enrollment], timeout : 60)
 test_enrollment_cli = executable('test-enrollment-cli',
         'test-enrollment-cli.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c', 'endorsement.c',
+        link_args : ['-Wl,--wrap=clock_gettime'],
         dependencies : [libsystemd, libcrypto])
 test('enrollment-cli', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_enrollment_cli, test_attestation_verify], timeout : 60)
