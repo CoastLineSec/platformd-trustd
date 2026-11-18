@@ -254,12 +254,39 @@ measurement log is not emitted as complete attestation evidence.
 
 ## Remote verification
 
-The verifier operates independently of the attester. `trustctl enrollment-begin`
-uses an independently provisioned Endorsement Key pin and a bounded credential
-activation challenge to bind an Attestation Key. The verifier owns the private
-enrollment directory, expiry, and revocation. No manufacturer trust anchor or
-account association is supplied. A revoked key remains revoked; key replacement
-requires a new enrollment. `tpm2_makecredential` is required only for enrollment.
+The verifier operates independently of the attester. `trustctl verify-endorsement`
+checks the Endorsement Key certificate in supplied `GetEnrollment` evidence
+against an explicit self-signed root, optional intermediate certificates, and
+CRLs selected by their certificate distribution-point URIs. The certificate
+public key must match the submitted Endorsement Key; only the platformd ECC
+P-256 storage-key template is supported. Chain and revocation checks use the
+verifier's current wall clock. No system trust store or network retrieval is
+used. No local TPM or running daemon is required. The result establishes
+validity under the selected root, not key possession, account ownership,
+approved boot state, or authentication.
+
+Each non-root certificate requires a current CRL selected by an exact HTTP or
+HTTPS distribution-point URI. Indirect CRLs require a signer on the validated
+certificate chain. Separate signer paths, relative names, reason partitions,
+and delta CRLs are not supported. CRL signatures require SHA-256, SHA-384, or
+SHA-512; RSA-PSS CRL signatures are not supported. The manual defines the input
+formats and size limits.
+
+`trustctl enrollment-begin` accepts either an independently provisioned
+Endorsement Key pin or the certificate-verification inputs. Certificate mode
+verifies the same parsed evidence before creating state or invoking
+`tpm2_makecredential`; it does not accept a verification report as authority.
+The accepted key becomes the enrollment pin. A bounded credential-activation
+challenge binds the Attestation Key. The initial challenge output includes
+`endorsementVerification` in certificate mode. The command does not select a
+manufacturer root or account association.
+
+The verifier owns the private enrollment directory, expiry, and revocation.
+Enrollment retains key pins, not ongoing certificate status. Certificate expiry
+or revocation does not automatically revoke an active enrollment; the verifier
+owns revalidation and revocation policy. A revoked key remains revoked; key
+replacement requires a new enrollment. `tpm2_makecredential` is required only
+for enrollment.
 
 `trustctl appraise-attestation` compares verified SHA-256 PCR 11 against an
 explicitly approved `systemd-measure` JSON reference and phase. It does not read

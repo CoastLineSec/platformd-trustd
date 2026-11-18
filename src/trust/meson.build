@@ -4,7 +4,7 @@ libcrypto = dependency('libcrypto', version : '>= 3.0')
 
 trustctl = executable(
         'trustctl',
-        'trustctl.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
+        'trustctl.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c', 'endorsement.c',
         dependencies : [libsystemd, libcrypto],
         install : true,
 )
@@ -134,7 +134,7 @@ test_attestation_request = executable(
         dependencies : [libsystemd, libcrypto],
 )
 test('attestation-request', test_attestation_request, args : [test_attestation_verify], timeout : 60)
-test_provision = executable('test-provision', 'test-provision.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
+test_provision = executable('test-provision', 'test-provision.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c', 'endorsement.c',
                             dependencies : [libsystemd, libcrypto])
 test('provision', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_provision], timeout : 60)
@@ -143,10 +143,15 @@ test_enrollment = executable('test-enrollment', 'test-enrollment.c', 'attestatio
 test('enrollment', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_enrollment], timeout : 60)
 test_enrollment_cli = executable('test-enrollment-cli',
-        'test-enrollment-cli.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
+        'test-enrollment-cli.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c', 'endorsement.c',
         dependencies : [libsystemd, libcrypto])
 test('enrollment-cli', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_enrollment_cli, test_attestation_verify], timeout : 60)
+test_endorsement = executable('test-endorsement', 'test-endorsement.c', 'endorsement.c',
+                             'enrollment.c', 'attestation-verify.c', dependencies : [libsystemd, libcrypto])
+test('endorsement', test_endorsement, timeout : 60)
+test('endorsement-cli', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-endorsement-cli.sh', trustctl, test_endorsement], timeout : 60)
 test('kernel-install', find_program('sh'),
      args : [meson.current_source_dir() / 'test-kernel-install.sh',
              meson.project_source_root() / 'units/70-platformd-trustd.install', trustctl])

@@ -51,8 +51,8 @@ unlock notifications, and records submitted by `pam_platformd.so` do not
 establish freshness.
 
 Attestation production is unavailable when the package is built without TPM2-TSS
-or the system has no usable TPM. Offline verification requires an independently
-supplied attestation key and challenge, but no TPM or running service.
+or the system has no usable TPM. Offline attestation verification requires an
+independently supplied attestation key and challenge, but no TPM or running service.
 Stateful verification requires explicit enrollment, approved boot references,
 and an application request. Authentication events remain declared evidence
 even when they are included in a TPM protected runtime measurement log.

@@ -261,7 +261,7 @@ static bool object_fields(sd_json_variant *v, const char * const *fields, size_t
         return true;
 }
 
-static int ek_validate(const uint8_t *data, size_t size) {
+static int ek_validate(const uint8_t *data, size_t size, EVP_PKEY **ret) {
         static const uint8_t prefix[] = {
                 0, 0x23, 0, 0x0b, 0, 3, 0, 0xb2, 0, 32,
                 0x83, 0x71, 0x97, 0x67, 0x44, 0x84, 0xb3, 0xf8,
@@ -307,8 +307,13 @@ static int ek_validate(const uint8_t *data, size_t size) {
                 r = -ENOMEM;
                 goto finish;
         }
-        if (EVP_PKEY_public_check(context) == 1)
+        if (EVP_PKEY_public_check(context) == 1) {
                 r = 0;
+                if (ret) {
+                        *ret = key;
+                        key = NULL;
+                }
+        }
 finish:
         EVP_PKEY_CTX_free(context);
         EVP_PKEY_free(key);
@@ -322,7 +327,7 @@ static int identity_validate(const char *ek, const char *ak, const char *name, E
         ek_size = hex_decode(ek, ek_bytes, sizeof ek_bytes);
         if (ek_size < 0)
                 return ek_size;
-        r = ek_validate(ek_bytes, (size_t) ek_size);
+        r = ek_validate(ek_bytes, (size_t) ek_size, NULL);
         if (r < 0)
                 return r;
         ak_size = hex_decode(ak, ak_bytes, sizeof ak_bytes);
@@ -366,6 +371,23 @@ static int evidence_parse(sd_json_variant *evidence, const char *expected_ek, En
         r = identity_validate(string_field(evidence, "ekPublicHex"), string_field(evidence, "akPublicHex"),
                               string_field(evidence, "akNameHex"), ret);
         return r;
+}
+
+int enrollment_evidence_key(sd_json_variant *evidence, EVP_PKEY **ret) {
+        EnrollmentRecord record = {};
+        uint8_t encoded[PUBLIC_SIZE_MAX];
+        int r;
+
+        if (!ret)
+                return -EINVAL;
+        *ret = NULL;
+        r = evidence_parse(evidence, string_field(evidence, "ekPublicHex"), &record);
+        if (r < 0)
+                return r;
+        r = hex_decode(record.ek, encoded, sizeof encoded);
+        if (r < 0)
+                return r;
+        return ek_validate(encoded, (size_t) r, ret);
 }
 
 static int private_file_check(int fd) {

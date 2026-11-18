@@ -2,12 +2,15 @@
 #pragma once
 
 #include <stdint.h>
+#include <openssl/types.h>
 #include <systemd/sd-json.h>
 
 typedef struct Enrollment Enrollment;
 
+int enrollment_evidence_key(sd_json_variant *evidence, EVP_PKEY **ret);
+
 /* The state directory must exist, be absolute, and be owned by the effective UID with mode 0700.
- * The endorsement key is an independently provisioned TPM2B_PUBLIC, not an evidence field. */
+ * The caller must establish trust in the endorsement key independently of unverified evidence. */
 int enrollment_begin(const char *state_dir, sd_json_variant *evidence, const char *expected_ek_hex,
                      uint64_t lifetime_sec, sd_json_variant **ret_challenge);
 int enrollment_complete(const char *state_dir, const char *key_id, const char *request_id,

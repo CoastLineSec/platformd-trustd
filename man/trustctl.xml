@@ -47,7 +47,8 @@
     root. The daemon restricts evidence production because it is a signing
     operation on the shared TPM. <command>provision</command> and
     <command>remove-boot-reference</command> require privilege to update boot
-    references. <command>verify-attestation</command> and
+    references. <command>verify-endorsement</command>,
+    <command>verify-attestation</command>, and
     <command>appraise-attestation</command> process supplied evidence offline and
     require neither privilege, a running daemon, nor a TPM.</para>
   </refsect1>
@@ -188,17 +189,79 @@
       </varlistentry>
 
       <varlistentry>
+        <term><command>verify-endorsement</command> <replaceable>FILE</replaceable>
+        <option>--trust-anchor=<replaceable>PEM</replaceable></option>
+        <optional><option>--certificate-chain=<replaceable>PEM</replaceable></option></optional>
+        <option>--revocations=<replaceable>JSON</replaceable></option></term>
+        <listitem><para>Verify the Endorsement Key certificate in the exact JSON
+        object returned by <function>GetEnrollment</function>. The certificate
+        public key must match the submitted Endorsement Key. Only the platformd
+        ECC P-256 storage-key template is supported. The evidence must be a
+        regular file of at most 64 KiB.</para>
+
+        <para>The trust anchor is an explicitly selected, self-signed root
+        certificate in a regular PEM file of at most 64 KiB. The optional
+        certificate-chain file contains at most 16 untrusted intermediate
+        certificates in PEM format and is limited to 1 MiB. Each DER certificate
+        is limited to 16 KiB. No system trust store or network retrieval is
+        used.</para>
+
+        <para>The required revocations file is a regular JSON file limited to
+        1 MiB. Its root object contains only <literal>crls</literal>, an array
+        of 1 through 32 objects. Each object contains exactly
+        <literal>distributionPoint</literal>, a URI from a certificate's CRL
+        distribution points, and <literal>pem</literal>, one PEM-encoded X.509
+        CRL. Distribution points must use full HTTP or HTTPS URIs, matched
+        exactly. The URI selects supplied revocation material; it is not
+        fetched. A current, matching CRL is required for every non-root
+        certificate. Certificate and CRL signatures, scope, validity periods,
+        and revocation status are checked using the verifier's current wall
+        clock.</para>
+
+        <para>Indirect CRLs are supported only when their signer is on the
+        validated certificate chain. Separate CRL-signer paths, relative
+        distribution-point names, reason-partitioned CRLs, and delta CRLs are
+        not supported. CRL signatures must use SHA-256, SHA-384, or SHA-512;
+        RSA-PSS CRL signatures are not supported. Certificate paths are checked
+        at OpenSSL authentication security level 2.</para>
+
+        <para>Print an
+        <literal>io.platformd.Trust.EndorsementVerification.v1</literal> report
+        as JSON on success. No result is printed on failure. Success establishes
+        certificate validity under the selected root and a matching Endorsement
+        Key. It does not prove possession of that key, bind an Attestation Key,
+        identify an account, approve boot state, or establish authentication.
+        The caller owns anchor selection and revocation-data
+        maintenance.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><command>enrollment-begin</command> <replaceable>FILE</replaceable>
         <option>--state-dir=<replaceable>DIR</replaceable></option>
         <option>--endorsement-key=<replaceable>FILE</replaceable></option>
         <option>--lifetime=<replaceable>SECONDS</replaceable></option></term>
+        <term><command>enrollment-begin</command> <replaceable>FILE</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--trust-anchor=<replaceable>PEM</replaceable></option>
+        <optional><option>--certificate-chain=<replaceable>PEM</replaceable></option></optional>
+        <option>--revocations=<replaceable>JSON</replaceable></option>
+        <option>--lifetime=<replaceable>SECONDS</replaceable></option></term>
         <listitem><para>Create a credential-activation challenge for the exact
-        JSON object returned by <function>GetEnrollment</function>. The
+        JSON object returned by <function>GetEnrollment</function>, supplied as
+        a regular file of at most 64 KiB. In explicit-key mode, the
         independently provisioned endorsement-key file contains a hexadecimal
-        marshaled <constant>TPM2B_PUBLIC</constant>. The evidence is not a trust
-        anchor. This command supports the platformd ECC P-256 key templates
-        and requires <command>tpm2_makecredential</command>. It does not access
-        a local TPM.</para>
+        marshaled <constant>TPM2B_PUBLIC</constant> and is limited to 4096 bytes.
+        The evidence is not a trust anchor. This command supports the platformd
+        ECC P-256 key templates and requires <command>tpm2_makecredential</command>.
+        It does not access a local TPM.</para>
+
+        <para>Alternatively, supply the certificate-verification options
+        described for <command>verify-endorsement</command>. The same parsed
+        evidence is verified before creating enrollment state or invoking
+        <command>tpm2_makecredential</command>. The verified Endorsement Key
+        becomes the enrollment pin. Mixing certificate options with
+        <option>--endorsement-key=</option> is rejected. A previously printed
+        verification report is not accepted as authority.</para>
 
         <para>The state directory must already exist, be absolute, owned by
         the effective user, and have mode 0700. Symlink path components are
@@ -212,7 +275,11 @@
         encrypted secret as JSON. The key identifier is SHA-256 of the complete
         marshaled Attestation Key public area. An active, revoked, or unexpired
         pending enrollment cannot be replaced. An inactive enrollment retains
-        its original key pins.</para></listitem>
+        its original key pins. Certificate mode also includes an
+        <literal>endorsementVerification</literal> report in the initial
+        challenge output. The enrollment retains key pins, not a continuously
+        checked certificate status. Later certificate expiry or revocation does
+        not automatically revoke an active enrollment.</para></listitem>
       </varlistentry>
 
       <varlistentry>
@@ -232,9 +299,10 @@
         <para>A matching attempt consumes the pending challenge, including an
         incorrect response, expiry, or a verifier reboot. A different request
         identifier does not consume the current challenge. Success activates
-        the enrollment under the provisioned endorsement-key pin. Credential
-        activation does not validate a manufacturer certificate or establish
-        its provenance.</para></listitem>
+        the enrollment under the selected endorsement-key pin. Credential
+        activation itself does not validate a certificate; certificate-mode
+        validation occurs when <command>enrollment-begin</command>
+        runs.</para></listitem>
       </varlistentry>
 
       <varlistentry>

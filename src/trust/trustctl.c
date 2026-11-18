@@ -25,6 +25,7 @@
 #include "attestation-verify.h"
 #include "attestation-request.h"
 #include "enrollment.h"
+#include "endorsement.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -465,25 +466,49 @@ static int parse_lifetime(const char *text, uint64_t *ret) {
         return 0;
 }
 
+static int verify_endorsement_files(sd_json_variant *evidence, const char *anchor_path,
+                                    const char *chain_path, const char *revocations_path,
+                                    sd_json_variant **ret) {
+        _cleanup_free_ char *anchor = NULL, *chain = NULL, *text = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *revocations = NULL;
+        int r;
+
+        r = read_attestation_file(anchor_path, 64U * 1024U, &anchor);
+        if (r >= 0 && chain_path)
+                r = read_attestation_file(chain_path, 1024U * 1024U, &chain);
+        if (r >= 0)
+                r = read_attestation_file(revocations_path, 1024U * 1024U, &text);
+        if (r >= 0)
+                r = sd_json_parse(text, 0, &revocations, NULL, NULL);
+        if (r >= 0)
+                r = endorsement_verify(evidence, anchor, chain, revocations, ret);
+        return r;
+}
+
 static int cmd_enrollment(const char *command, int argc, char **argv) {
         enum {
-                STATE, EK, LIFETIME, REQUEST_ID, RESPONSE, REQUEST, TOKEN, REFERENCE, PHASE, DECLARED, _OPTION_MAX,
+                STATE, EK, LIFETIME, REQUEST_ID, RESPONSE, REQUEST, TOKEN, REFERENCE, PHASE, DECLARED,
+                ANCHOR, CHAIN, REVOCATIONS, _OPTION_MAX,
         };
         static const char * const names[] = {
                 "--state-dir=", "--endorsement-key=", "--lifetime=", "--request-id=", "--response=",
                 "--request=", "--token=", "--reference=", "--phase=", "--allow-root-declared-authentication",
+                "--trust-anchor=", "--certificate-chain=", "--revocations=",
         };
         const char *options[_OPTION_MAX] = {}, *argument = NULL;
         _cleanup_(sd_json_variant_unrefp) sd_json_variant *input = NULL, *reference = NULL, *request = NULL, *report = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *endorsement = NULL;
         _cleanup_free_ char *text = NULL, *key = NULL, *reference_text = NULL;
         char *response = NULL;
         Enrollment *enrollment = NULL;
-        unsigned allowed = 1U << STATE, seen = 0;
+        unsigned allowed = 1U << STATE, required, seen = 0;
         uint64_t lifetime = 0;
         int r = -EINVAL;
 
         if (streq(command, "enrollment-begin"))
-                allowed |= (1U << EK) | (1U << LIFETIME);
+                allowed |= (1U << EK) | (1U << LIFETIME) | (1U << ANCHOR) | (1U << CHAIN) | (1U << REVOCATIONS);
+        else if (streq(command, "verify-endorsement"))
+                allowed = (1U << ANCHOR) | (1U << CHAIN) | (1U << REVOCATIONS);
         else if (streq(command, "enrollment-complete"))
                 allowed |= (1U << REQUEST_ID) | (1U << RESPONSE);
         else if (streq(command, "request-begin"))
@@ -514,19 +539,39 @@ static int cmd_enrollment(const char *command, int argc, char **argv) {
                 if (j == _OPTION_MAX)
                         goto finish;
         }
-        if (!argument || !*argument || seen != allowed)
+        required = allowed;
+        if (streq(command, "enrollment-begin")) {
+                if (seen & (1U << EK))
+                        required = (1U << STATE) | (1U << LIFETIME) | (1U << EK);
+                else
+                        required = (1U << STATE) | (1U << LIFETIME) | (1U << ANCHOR) | (1U << REVOCATIONS) |
+                                   (seen & (1U << CHAIN));
+        } else if (streq(command, "verify-endorsement"))
+                required = (1U << ANCHOR) | (1U << REVOCATIONS) | (seen & (1U << CHAIN));
+        if (!argument || !*argument || seen != required)
                 goto finish;
         if ((allowed & (1U << LIFETIME)) && parse_lifetime(options[LIFETIME], &lifetime) < 0)
                 goto finish;
 
-        if (streq(command, "enrollment-begin")) {
-                r = read_attestation_file(argument, 16384, &text);
-                if (r >= 0)
+        if (streq(command, "enrollment-begin") || streq(command, "verify-endorsement")) {
+                r = read_attestation_file(argument, 64U * 1024U, &text);
+                if (r >= 0 && options[EK])
                         r = read_attestation_file(options[EK], 4096, &key);
                 if (r >= 0)
                         r = sd_json_parse(text, 0, &input, NULL, NULL);
-                if (r >= 0)
-                        r = enrollment_begin(options[STATE], input, strip_space(key), lifetime, &report);
+                if (r >= 0 && options[ANCHOR])
+                        r = verify_endorsement_files(input, options[ANCHOR], options[CHAIN], options[REVOCATIONS], &endorsement);
+                if (r >= 0) {
+                        if (streq(command, "verify-endorsement"))
+                                report = sd_json_variant_ref(endorsement);
+                        else {
+                                r = enrollment_begin(options[STATE], input, key ? strip_space(key) : jstr(input, "ekPublicHex"),
+                                                     lifetime, &report);
+                                if (r >= 0 && endorsement)
+                                        r = sd_json_variant_merge_objectbo(&report,
+                                                SD_JSON_BUILD_PAIR_VARIANT("endorsementVerification", endorsement));
+                        }
+                }
         } else if (streq(command, "enrollment-complete")) {
                 r = read_attestation_file_full(options[RESPONSE], 256, true, &response);
                 if (r >= 0)
@@ -1031,7 +1076,9 @@ static void usage(void) {
                "  trustctl appraise-attestation FILE --attestation-key=FILE --nonce=HEX --reference=FILE --phase=STRING\n"
                "                                  Compare verified PCR 11 against an approved reference\n"
                "  trustctl enroll                   EK/AK enrollment evidence (credential activation)\n"
+               "  trustctl verify-endorsement FILE --trust-anchor=PEM [--certificate-chain=PEM] --revocations=JSON\n"
                "  trustctl enrollment-begin FILE --state-dir=DIR --endorsement-key=FILE --lifetime=SECONDS\n"
+               "  trustctl enrollment-begin FILE --state-dir=DIR --trust-anchor=PEM [--certificate-chain=PEM] --revocations=JSON --lifetime=SECONDS\n"
                "  trustctl enrollment-complete KEY --state-dir=DIR --request-id=HEX --response=FILE\n"
                "  trustctl enrollment-status KEY --state-dir=DIR\n"
                "  trustctl enrollment-revoke KEY --state-dir=DIR\n"
@@ -1077,7 +1124,7 @@ int main(int argc, char *argv[]) {
                 return cmd_verify_attestation(argc - 2, argv + 2);
         if (streq(cmd, "appraise-attestation"))
                 return cmd_appraise_attestation(argc - 2, argv + 2);
-        if (streq(cmd, "enrollment-begin") || streq(cmd, "enrollment-complete") ||
+        if (streq(cmd, "verify-endorsement") || streq(cmd, "enrollment-begin") || streq(cmd, "enrollment-complete") ||
             streq(cmd, "enrollment-status") || streq(cmd, "enrollment-revoke") ||
             streq(cmd, "request-begin") || streq(cmd, "request-complete"))
                 return cmd_enrollment(cmd, argc - 2, argv + 2);

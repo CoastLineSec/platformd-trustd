@@ -22,7 +22,7 @@ run() {
 
 cd -- "$source_dir"
 git diff --check
-shellcheck .github/scripts/check.sh
+shellcheck .github/scripts/check.sh src/trust/test-endorsement-cli.sh
 actionlint .github/workflows/ci.yml
 for file in man/*.xml; do
         xmllint --nonet --noout "$file"
