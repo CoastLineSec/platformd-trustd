@@ -86,6 +86,7 @@ typedef struct Manager {
         struct IdentityRequest *identity_requests;
         sd_json_variant *identities;
         sd_bus_slot *session_query;
+        sd_event_source *session_retry;
         sd_event_source *reconnect;
         sd_bus_slot *sleep_query;
         sd_event_source *sleep_retry;
@@ -908,7 +909,7 @@ static int vl_evaluate_policy(sd_varlink *link, sd_json_variant *parameters,
 /* --- logind tracking --------------------------------------------------------- */
 
 static void setup_logind(Manager *m);
-static int enumerate_sessions(Manager *m);
+static void enumerate_sessions(Manager *m);
 static void query_preparing_for_sleep(Manager *m);
 
 static void set_preparing_for_sleep(Manager *m, int preparing) {
@@ -968,8 +969,23 @@ static void query_preparing_for_sleep(Manager *m) {
 
 static void forget_sessions(Manager *m) {
         m->session_query = sd_bus_slot_unref(m->session_query);
+        m->session_retry = sd_event_source_unref(m->session_retry);
         while (m->sessions)
                 untrack_by_path(m, m->sessions->path);
+}
+
+static int on_session_retry(sd_event_source *source, uint64_t usec, void *userdata) {
+        Manager *m = userdata;
+
+        m->session_retry = sd_event_source_unref(m->session_retry);
+        enumerate_sessions(m);
+        return 0;
+}
+
+static void schedule_session_retry(Manager *m) {
+        if (!m->session_retry)
+                (void) sd_event_add_time(m->event, &m->session_retry, CLOCK_BOOTTIME,
+                                        now_boottime() + 2000000, 0, on_session_retry, m);
 }
 
 static int on_props(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1070,30 +1086,37 @@ static int on_sessions(sd_bus_message *msg, void *userdata, sd_bus_error *error)
 
         m->session_query = sd_bus_slot_unref(m->session_query);
         if (m->query_generation != m->session_generation) {
-                (void) enumerate_sessions(m);
+                schedule_session_retry(m);
                 return 0;
         }
         if (sd_bus_message_is_method_error(msg, NULL) ||
             sd_bus_message_enter_container(msg, 'a', "(susso)") <= 0)
-                return 0;
-        while ((r = sd_bus_message_read(msg, "(susso)", &id, &uid, &user, &seat, &path)) > 0)
+                goto fail;
+        while ((r = sd_bus_message_read(msg, "(susso)", &id, &uid, &user, &seat, &path)) > 0) {
+                if (!trust_text_valid(id, 256) || !*id)
+                        goto fail;
                 track_session(m, id, path, -1);
-        if (r < 0)
-                forget_sessions(m);
+        }
+        if (r < 0 || sd_bus_message_exit_container(msg) < 0 || sd_bus_message_at_end(msg, true) <= 0)
+                goto fail;
+        return 0;
+fail:
+        forget_sessions(m);
+        schedule_session_retry(m);
         return 0;
 }
 
-static int enumerate_sessions(Manager *m) {
+static void enumerate_sessions(Manager *m) {
         _cleanup_(sd_bus_message_unrefp) sd_bus_message *request = NULL;
-        int r;
 
         m->session_query = sd_bus_slot_unref(m->session_query);
+        m->session_retry = sd_event_source_unref(m->session_retry);
         m->query_generation = m->session_generation;
-        r = sd_bus_message_new_method_call(m->bus, &request, "org.freedesktop.login1",
-                                          "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "ListSessions");
-        if (r < 0)
-                return r;
-        return sd_bus_call_async(m->bus, &m->session_query, request, on_sessions, m, 2000000);
+        if (!m->bus ||
+            sd_bus_message_new_method_call(m->bus, &request, "org.freedesktop.login1",
+                                          "/org/freedesktop/login1", "org.freedesktop.login1.Manager", "ListSessions") < 0 ||
+            sd_bus_call_async(m->bus, &m->session_query, request, on_sessions, m, 2000000) < 0)
+                schedule_session_retry(m);
 }
 
 static int on_logind_owner(sd_bus_message *msg, void *userdata, sd_bus_error *error) {
@@ -1108,7 +1131,7 @@ static int on_logind_owner(sd_bus_message *msg, void *userdata, sd_bus_error *er
         forget_sessions(m);
         if (*new_owner) {
                 query_preparing_for_sleep(m);
-                (void) enumerate_sessions(m);
+                enumerate_sessions(m);
         }
         return 0;
 }
@@ -1169,8 +1192,9 @@ static void setup_logind(Manager *m) {
                 goto fail;
         r = sd_bus_match_signal(m->bus, NULL, NULL, "/org/freedesktop/DBus/Local",
                                "org.freedesktop.DBus.Local", "Disconnected", on_bus_disconnected, m);
-        if (r < 0 || enumerate_sessions(m) < 0)
+        if (r < 0)
                 goto fail;
+        enumerate_sessions(m);
         query_preparing_for_sleep(m);
         return;
 fail:

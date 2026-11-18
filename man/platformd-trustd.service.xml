@@ -59,7 +59,9 @@
     <varname>LockedHint</varname> property. It is reported as
     <literal>locked</literal>, <literal>unlocked</literal>, or
     <literal>unknown</literal>. Locking or losing authoritative lock state
-    clears verification freshness. Unlocking does not establish it.</para>
+    clears verification freshness. Unlocking does not establish it.
+    Failed or incomplete session enumeration is retried asynchronously.
+    A logind owner change discards cached session state and pending requests.</para>
 
     <para>New sessions have no verification timestamp. Session creation and
     unlock notifications do not establish freshness. Freshness is established

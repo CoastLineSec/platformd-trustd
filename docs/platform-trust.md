@@ -75,8 +75,11 @@ Lock state and verification freshness have separate sources and update rules.
 The `lockState` field is read from the logind `LockedHint` property. Its value is
 `locked`, `unlocked`, or `unknown`. Locking or losing authoritative lock state
 invalidates verification freshness. Unlocking never establishes freshness.
-Subscriptions precede enumeration. A logind owner change discards cached session
-state; a system-bus disconnect terminates the service for automatic restart.
+Subscriptions precede enumeration. Failed, missing, malformed, or obsolete
+enumeration replies are retried asynchronously after two seconds. Only one
+enumeration request or retry is pending at a time. A logind owner change discards
+cached session state; a system-bus disconnect terminates the service for automatic
+restart.
 
 A new session has no verification timestamp. Creating or unlocking a session
 does not establish freshness. A successful authentication event establishes
