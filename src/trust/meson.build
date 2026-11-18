@@ -4,7 +4,7 @@ libcrypto = dependency('libcrypto', version : '>= 3.0')
 
 trustctl = executable(
         'trustctl',
-        'trustctl.c', 'pe.c', 'attestation-verify.c',
+        'trustctl.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
         dependencies : [libsystemd, libcrypto],
         install : true,
 )
@@ -120,10 +120,33 @@ test('attestation-verify', test_attestation_verify)
 test('attestation-cli', find_program('sh'),
      args : [meson.current_source_dir() / 'test-attestation-cli.sh', trustctl, test_attestation_verify],
      timeout : 60)
-test_provision = executable('test-provision', 'test-provision.c', 'pe.c', 'attestation-verify.c',
+test_attestation_appraise = executable(
+        'test-attestation-appraise', 'test-attestation-appraise.c', 'attestation-appraise.c', 'attestation-verify.c',
+        dependencies : [libsystemd, libcrypto],
+)
+test('attestation-appraise', test_attestation_appraise, args : [test_attestation_verify], timeout : 60)
+test('attestation-appraise-cli', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-attestation-appraise-cli.sh', trustctl, test_attestation_verify],
+     timeout : 60)
+test_attestation_request = executable(
+        'test-attestation-request', 'test-attestation-request.c', 'attestation-request.c',
+        'attestation-appraise.c', 'attestation-verify.c',
+        dependencies : [libsystemd, libcrypto],
+)
+test('attestation-request', test_attestation_request, args : [test_attestation_verify], timeout : 60)
+test_provision = executable('test-provision', 'test-provision.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
                             dependencies : [libsystemd, libcrypto])
 test('provision', find_program('sh'),
      args : [meson.current_source_dir() / 'test-env.sh', test_provision], timeout : 60)
+test_enrollment = executable('test-enrollment', 'test-enrollment.c', 'attestation-verify.c',
+                             dependencies : [libsystemd, libcrypto])
+test('enrollment', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-env.sh', test_enrollment], timeout : 60)
+test_enrollment_cli = executable('test-enrollment-cli',
+        'test-enrollment-cli.c', 'pe.c', 'attestation-verify.c', 'attestation-appraise.c', 'attestation-request.c', 'enrollment.c',
+        dependencies : [libsystemd, libcrypto])
+test('enrollment-cli', find_program('sh'),
+     args : [meson.current_source_dir() / 'test-env.sh', test_enrollment_cli, test_attestation_verify], timeout : 60)
 test('kernel-install', find_program('sh'),
      args : [meson.current_source_dir() / 'test-kernel-install.sh',
              meson.project_source_root() / 'units/70-platformd-trustd.install', trustctl])
@@ -135,6 +158,24 @@ test('runtime-log', executable('test-runtime-log',
         'test-runtime-log.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
         dependencies : [libsystemd, libcrypto],
         link_args : ['-Wl,--wrap=attest_nv_read', '-Wl,--wrap=attest_nv_extend']))
+test('verification-event', executable('test-verification-event',
+        'test-verification-event.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
+        dependencies : [libsystemd, libcrypto],
+        link_args : [
+                '-Wl,--wrap=runtime_timestamp_now',
+                '-Wl,--wrap=sd_varlink_get_peer_uid',
+                '-Wl,--wrap=sd_session_get_uid',
+                '-Wl,--wrap=sd_session_get_username',
+                '-Wl,--wrap=sd_session_get_class',
+                '-Wl,--wrap=sd_session_is_active',
+                '-Wl,--wrap=sd_session_is_remote',
+                '-Wl,--wrap=sd_varlink_reply',
+                '-Wl,--wrap=sd_varlink_error',
+                '-Wl,--wrap=sd_varlink_error_invalid_parameter_name',
+                '-Wl,--wrap=sd_journal_send',
+                '-Wl,--wrap=worker_start',
+                '-Wl,--wrap=worker_free',
+        ]))
 test_logind = executable('test-logind', 'test-logind.c', 'attest-stub.c', 'runtime-event.c', 'trust-util.c', 'verify.c', 'worker.c',
                         dependencies : [libsystemd, libcrypto])
 test('logind', find_program('sh'), args : [meson.current_source_dir() / 'test-logind.sh', test_logind])

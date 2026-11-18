@@ -74,6 +74,20 @@ typedef enum Fault {
         FAULT_LOGIN_EXPIRED,
         FAULT_LOGIN_RESULT,
         FAULT_SLEEP_INVALIDATION,
+        FAULT_CONTEXT_CHALLENGE,
+        FAULT_CONTEXT_DIGEST,
+        FAULT_CONTEXT_AUDIENCE,
+        FAULT_CONTEXT_EXTRA,
+        FAULT_CONTEXT_DUPLICATE,
+        FAULT_CONTEXT_BOOT_FUTURE,
+        FAULT_CONTEXT_REAL_FUTURE,
+        FAULT_CONTEXT_BOOT_ZERO,
+        FAULT_CONTEXT_REAL_ZERO,
+        FAULT_CONTEXT_TTY,
+        FAULT_CONTEXT_SERVICE,
+        FAULT_CONTEXT_RESULT,
+        FAULT_CONTEXT_QUALITY,
+        FAULT_CONTEXT_FRESHNESS,
         _FAULT_MAX,
         VALID_VERIFY_SUCCESS,
         VALID_VERIFY_FAILURE,
@@ -82,6 +96,19 @@ typedef enum Fault {
         VALID_SLEEP,
         VALID_UNSAFE_CLOCK,
         VALID_NV_UNWRITTEN,
+        VALID_CONTEXT,
+        VALID_UNLOCKED,
+        VALID_OTHER_SESSION_LOCK,
+        VALID_UNKNOWN_LOCK,
+        VALID_CONTEXT_THEN_LOCK,
+        VALID_CONTEXT_THEN_UNLOCK,
+        VALID_CONTEXT_THEN_UNKNOWN,
+        VALID_CONTEXT_THEN_OTHER_LOCK,
+        VALID_CONTEXT_THEN_SLEEP,
+        VALID_CONTEXT_AFTER_LOCK,
+        VALID_CONTEXT_AFTER_SLEEP,
+        VALID_CONTEXT_SLEEP_REAUTH,
+        VALID_CONTEXT_LOCK_UNLOCK,
 } Fault;
 
 typedef struct Fixture {
@@ -228,6 +255,25 @@ static Buffer header(bool nv, const uint8_t signer[34], const uint8_t nonce[32],
 }
 
 static char *record(unsigned index, Fault fault) {
+        if (fault == VALID_CONTEXT_THEN_LOCK)
+                fault = index == 0 ? VALID_CONTEXT : FAULT_NONE;
+        else if (fault == VALID_CONTEXT_THEN_UNLOCK)
+                fault = index == 0 ? VALID_CONTEXT : VALID_UNLOCKED;
+        else if (fault == VALID_CONTEXT_THEN_UNKNOWN)
+                fault = index == 0 ? VALID_CONTEXT : VALID_UNKNOWN_LOCK;
+        else if (fault == VALID_CONTEXT_THEN_OTHER_LOCK)
+                fault = index == 0 ? VALID_CONTEXT : VALID_OTHER_SESSION_LOCK;
+        else if (fault == VALID_CONTEXT_THEN_SLEEP)
+                fault = index == 0 ? VALID_CONTEXT : VALID_SLEEP;
+        else if (fault == VALID_CONTEXT_AFTER_LOCK)
+                fault = index == 0 ? FAULT_NONE : VALID_CONTEXT;
+        else if (fault == VALID_CONTEXT_AFTER_SLEEP)
+                fault = index == 0 ? VALID_SLEEP : VALID_CONTEXT;
+        else if (fault == VALID_CONTEXT_SLEEP_REAUTH)
+                fault = index == 1 ? VALID_SLEEP : VALID_CONTEXT;
+        else if (fault == VALID_CONTEXT_LOCK_UNLOCK)
+                fault = index == 0 ? VALID_CONTEXT : index == 1 ? FAULT_NONE : VALID_UNLOCKED;
+
         sd_json_variant *payload = NULL, *object = NULL;
         char *text = NULL;
         uint64_t boottime = index + 1;
@@ -235,7 +281,8 @@ static char *record(unsigned index, Fault fault) {
         const char *type = "lock-state", *source = "org.freedesktop.login1.Session.LockedHint", *quality = "observed";
         bool login = fault == VALID_LOGIN || (fault == VALID_DELAYED_LOGIN && index == 1) ||
                      (fault >= FAULT_LOGIN_LEADER && fault <= FAULT_LOGIN_RESULT);
-        bool authentication = login || fault == VALID_VERIFY_SUCCESS || fault == VALID_VERIFY_FAILURE ||
+        bool context = fault == VALID_CONTEXT || (fault >= FAULT_CONTEXT_CHALLENGE && fault <= FAULT_CONTEXT_FRESHNESS);
+        bool authentication = login || context || fault == VALID_VERIFY_SUCCESS || fault == VALID_VERIFY_FAILURE ||
                               (fault >= FAULT_AUTH_PEER && fault <= FAULT_AUTH_REAL_UID);
 
         if (fault == FAULT_RECORD_BOOT_ID)
@@ -248,7 +295,8 @@ static char *record(unsigned index, Fault fault) {
                 boottime = index == 1 ? 2 : index + 5;
         if (authentication) {
                 type = "authentication";
-                source = login ? "io.platformd.Trust.CompleteLoginAuthentication" : "io.platformd.Trust.SubmitAuthEvent";
+                source = login ? "io.platformd.Trust.CompleteLoginAuthentication" :
+                         context ? "io.platformd.Trust.SubmitVerificationEvent" : "io.platformd.Trust.SubmitAuthEvent";
                 quality = "declared";
                 assert(sd_json_buildo(&payload,
                                      SD_JSON_BUILD_PAIR_STRING("user", "fixture-user"),
@@ -285,6 +333,38 @@ static char *record(unsigned index, Fault fault) {
                                                                  fault == VALID_DELAYED_LOGIN ? 6 : boottime + 2) >= 0);
                         assert(sd_json_variant_set_field_unsigned(&payload, "completedRealtimeUSec", 1000002 + index) >= 0);
                 }
+                if (context) {
+                        sd_json_variant *value = NULL;
+
+                        assert(sd_json_buildo(&value,
+                                             SD_JSON_BUILD_PAIR_STRING("challengeHex", fault == FAULT_CONTEXT_CHALLENGE ? "01" :
+                                                                      "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"),
+                                             SD_JSON_BUILD_PAIR_STRING("audience", fault == FAULT_CONTEXT_AUDIENCE ? "\n" : "https://service.example"),
+                                             SD_JSON_BUILD_PAIR_STRING("operationDigestHex", fault == FAULT_CONTEXT_DIGEST ? "not-hex" :
+                                                                      "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")) >= 0);
+                        if (fault == FAULT_CONTEXT_EXTRA)
+                                assert(sd_json_variant_set_field_string(&value, "extra", "") >= 0);
+                        if (fault == FAULT_CONTEXT_DUPLICATE) {
+                                value = sd_json_variant_unref(value);
+                                assert(sd_json_parse("{\"challengeHex\":\"\",\"challengeHex\":\"\",\"audience\":\"x\",\"operationDigestHex\":\"\"}",
+                                                     0, &value, NULL, NULL) >= 0);
+                        }
+                        assert(sd_json_variant_set_field(&payload, "context", value) >= 0);
+                        sd_json_variant_unref(value);
+                        assert(sd_json_variant_set_field_string(&payload, "tty", fault == FAULT_CONTEXT_TTY ? "tty1" : "") >= 0);
+                        assert(sd_json_variant_set_field_unsigned(&payload, "verificationBoottimeUSec",
+                                                                 fault == FAULT_CONTEXT_BOOT_ZERO ? 0 : boottime + (fault == FAULT_CONTEXT_BOOT_FUTURE)) >= 0);
+                        assert(sd_json_variant_set_field_unsigned(&payload, "verificationRealtimeUSec",
+                                                                 fault == FAULT_CONTEXT_REAL_ZERO ? 0 : 1000000 + index + (fault == FAULT_CONTEXT_REAL_FUTURE)) >= 0);
+                        if (fault == FAULT_CONTEXT_SERVICE)
+                                assert(sd_json_variant_set_field_string(&payload, "pamService", "other") >= 0);
+                        if (fault == FAULT_CONTEXT_RESULT)
+                                assert(sd_json_variant_set_field_string(&payload, "result", "failure") >= 0);
+                        if (fault == FAULT_CONTEXT_QUALITY)
+                                assert(sd_json_variant_set_field_string(&payload, "evidenceQuality", "verified") >= 0);
+                        if (fault == FAULT_CONTEXT_FRESHNESS)
+                                assert(sd_json_variant_set_field_boolean(&payload, "qualifiesForFreshness", false) >= 0);
+                }
         } else if (fault == VALID_SLEEP || fault == FAULT_SLEEP_INVALIDATION) {
                 type = "sleep-state";
                 source = "org.freedesktop.login1.Manager.PrepareForSleep";
@@ -293,9 +373,11 @@ static char *record(unsigned index, Fault fault) {
                                      SD_JSON_BUILD_PAIR_BOOLEAN("freshnessInvalidated", fault != FAULT_SLEEP_INVALIDATION)) >= 0);
         } else
                 assert(sd_json_buildo(&payload,
-                                     SD_JSON_BUILD_PAIR_STRING("sessionId", "fixture-session"),
-                                     SD_JSON_BUILD_PAIR_STRING("lockState", fault == FAULT_RECORD_PAYLOAD ? "yes" : "locked"),
-                                     SD_JSON_BUILD_PAIR_BOOLEAN("freshnessInvalidated", true)) >= 0);
+                                     SD_JSON_BUILD_PAIR_STRING("sessionId", fault == VALID_OTHER_SESSION_LOCK ? "other-session" : "fixture-session"),
+                                     SD_JSON_BUILD_PAIR_STRING("lockState", fault == FAULT_RECORD_PAYLOAD ? "yes" :
+                                                              fault == VALID_UNLOCKED ? "unlocked" :
+                                                              fault == VALID_UNKNOWN_LOCK ? "unknown" : "locked"),
+                                     SD_JSON_BUILD_PAIR_BOOLEAN("freshnessInvalidated", fault != VALID_UNLOCKED)) >= 0);
         assert(sd_json_buildo(&object,
                              SD_JSON_BUILD_PAIR_STRING("format", fault == FAULT_RECORD_FORMAT ?
                                                       "io.platformd.Trust.RuntimeEvent.v1" : "io.platformd.Trust.RuntimeEvent.v2"),
@@ -532,7 +614,7 @@ static sd_json_variant *accepted(const Fixture *f, unsigned n_events) {
 static void test_positive(EVP_PKEY *key) {
         static const Fault variants[] = {
                 VALID_VERIFY_SUCCESS, VALID_VERIFY_FAILURE, VALID_LOGIN, VALID_DELAYED_LOGIN,
-                VALID_SLEEP, VALID_UNSAFE_CLOCK, VALID_NV_UNWRITTEN,
+                VALID_SLEEP, VALID_UNSAFE_CLOCK, VALID_NV_UNWRITTEN, VALID_CONTEXT,
         };
 
         for (unsigned n = 0; n <= 3; n++) {
@@ -784,8 +866,8 @@ static void test_unsigned_assertions(EVP_PKEY *key) {
         fixture_done(&f);
 }
 
-static void write_fixture(EVP_PKEY *key, const char *directory) {
-        Fixture f = fixture_new(key, 3, FAULT_NONE);
+static void write_fixture(EVP_PKEY *key, const char *directory, Fault fault) {
+        Fixture f = fixture_new(key, 3, fault);
         char *text = NULL;
         const char *names[] = { "token.json", "ak.hex", "nonce.hex" };
         const char *values[3];
@@ -817,7 +899,27 @@ int main(int argc, char **argv) {
 
         assert(key);
         if (argc == 3 && strcmp(argv[1], "--write-fixture") == 0)
-                write_fixture(key, argv[2]);
+                write_fixture(key, argv[2], FAULT_NONE);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-lock-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_THEN_LOCK);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-unlock-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_THEN_UNLOCK);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-unknown-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_THEN_UNKNOWN);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-other-lock-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_THEN_OTHER_LOCK);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-sleep-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_THEN_SLEEP);
+        else if (argc == 3 && strcmp(argv[1], "--write-lock-context-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_AFTER_LOCK);
+        else if (argc == 3 && strcmp(argv[1], "--write-sleep-context-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_AFTER_SLEEP);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-sleep-context-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_SLEEP_REAUTH);
+        else if (argc == 3 && strcmp(argv[1], "--write-context-lock-unlock-fixture") == 0)
+                write_fixture(key, argv[2], VALID_CONTEXT_LOCK_UNLOCK);
         else if (argc == 2 && strcmp(argv[1], "--fixture") == 0) {
                 Fixture f = fixture_new(key, 3, FAULT_NONE);
                 char *text = NULL;

@@ -243,6 +243,50 @@ TPM support was not built or no TPM device is available. TPM command, authorizat
 or malformed-evidence failures return `AttestationFailed`. An incomplete runtime
 measurement log is not emitted as complete attestation evidence.
 
+## Remote verification
+
+The verifier operates independently of the attester. `trustctl enrollment-begin`
+uses an independently provisioned Endorsement Key pin and a bounded credential
+activation challenge to bind an Attestation Key. The verifier owns the private
+enrollment directory, expiry, and revocation. No manufacturer trust anchor or
+account association is supplied. A revoked key remains revoked; key replacement
+requires a new enrollment. `tpm2_makecredential` is required only for enrollment.
+
+`trustctl appraise-attestation` compares verified SHA-256 PCR 11 against an
+explicitly approved `systemd-measure` JSON reference and phase. It does not read
+the attester's local reference directory. Approval of PCR 11 is not approval of
+firmware, Secure Boot policy, or every component of the running system.
+
+`trustctl request-begin` creates a verifier-owned challenge for an enrolled key,
+UID, session, audience, and operation digest. `VerifyUserWithContext` in verifyd
+performs PAM verification with that immutable context. Successful completion
+submits `SubmitVerificationEvent` as root. The receiver checks session ownership,
+activity, locality, lock state, and invalidation ordering. Completion timestamps
+follow worker cleanup and final session validation, not the PAM return instant.
+The record timestamps identify receipt; the payload retains
+`verificationBoottimeUSec` and `verificationRealtimeUSec`.
+
+The submission reply precedes the asynchronous NV extension. PAM success is not
+proof of measurement or remote acceptance. The token remains restricted to root
+and contains the global retained history. No unprivileged export permission is
+implied by a contextual verification request. A version 2 verifier that does not
+recognize `SubmitVerificationEvent` rejects that record; it must not ignore it.
+
+`trustctl request-complete` consumes the matching request before appraisal and
+holds the enrollment lock through verification. It requires the exact context
+in the certified retained history, with no later session lock or sleep
+invalidation. The application must explicitly accept root-declared PAM evidence.
+The unpredictable challenge and verifier-owned expiry establish the request
+window; device clocks do not. A failed appraisal consumes the request as well.
+Restarting the verifier's process retains state; rebooting invalidates pending
+requests. Revocation invalidates outstanding requests.
+
+The result is not a bearer credential or an authorization decision. The remote
+service owns authenticated transport, account-to-device mapping, approved
+references, operation encoding, and authorization. The measured declaration
+does not prove user consent or a particular factor. Root can submit declarations
+and controls the runtime NV index; measurement does not remove that trust boundary.
+
 ## Limitations
 
 `trustctl verify-attestation` verifies an evidence envelope offline against an

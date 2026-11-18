@@ -57,7 +57,7 @@ type Session (
 )
 
 # Every logind session, as a trust record. lockState comes from logind.
-# Verification fields come only from qualifying SubmitAuthEvent calls.
+# Verification fields come from qualifying authentication event submissions.
 method ListSessions() -> (sessions: []Session)
 
 # One session's trust record.
@@ -116,6 +116,28 @@ method SubmitAuthEvent(
         declaredMethod: string,
         result: string,
         sessionId: string
+) -> ()
+
+type VerificationContext (
+        challengeHex: string,
+        audience: string,
+        operationDigestHex: string
+)
+
+# Declare successful platformd-verify PAM execution for an application context.
+# The caller must be root. The session must be local, active, unlocked, and owned
+# by the supplied user and UID. Hexadecimal fields contain 32 bytes in lowercase.
+# audience is printable ASCII, at most 256 bytes. Completion timestamps use
+# CLOCK_BOOTTIME and CLOCK_REALTIME and must be less than 120 seconds old.
+# A reply acknowledges receipt, not completion of the asynchronous NV extension.
+# Evidence remains root-declared; the context does not prove user consent.
+method SubmitVerificationEvent(
+        user: string,
+        uid: int,
+        sessionId: string,
+        context: VerificationContext,
+        verificationBoottimeUSec: int,
+        verificationRealtimeUSec: int
 ) -> ()
 
 # Recent authentication events, newest first. The list is bounded and in-memory.

@@ -55,6 +55,7 @@ typedef struct TrackedSession {
         char *path;
         sd_bus_slot *lock_query;
         TrustSessionState state;
+        uint64_t verification_invalidated_usec;
 } TrackedSession;
 
 typedef struct AuthEvent {
@@ -92,6 +93,7 @@ typedef struct Manager {
         sd_event_source *sleep_retry;
         int preparing_for_sleep;
         uint64_t session_generation, query_generation;
+        uint64_t verification_invalidated_usec;
         struct BackendRequest *backend_head, *backend_tail;
         sd_json_variant *backend_result;
         int listener_lock;
@@ -404,6 +406,21 @@ static TrackedSession *find_tracked_by_path(Manager *m, const char *path) {
         return NULL;
 }
 
+static void invalidate_session_verification(TrackedSession *s) {
+        RuntimeTimestamp timestamp;
+
+        trust_session_invalidate_verification(&s->state);
+        s->verification_invalidated_usec = runtime_timestamp_now(&timestamp) < 0
+                ? UINT64_MAX : timestamp.boottime_usec;
+}
+
+static void invalidate_verification_epoch(Manager *m) {
+        RuntimeTimestamp timestamp;
+
+        m->verification_invalidated_usec = runtime_timestamp_now(&timestamp) < 0
+                ? UINT64_MAX : timestamp.boottime_usec;
+}
+
 static int on_locked_hint(sd_bus_message *message, void *userdata, sd_bus_error *error) {
         TrackedSession *s = userdata;
         int locked = -1;
@@ -415,7 +432,7 @@ static int on_locked_hint(sd_bus_message *message, void *userdata, sd_bus_error 
                 locked = -1;
         trust_session_set_lock(&s->state, locked);
         if (locked != 0)
-                trust_session_invalidate_verification(&s->state);
+                invalidate_session_verification(s);
         return 0;
 }
 
@@ -429,7 +446,7 @@ static void query_locked_hint(Manager *m, TrackedSession *s) {
             sd_bus_message_append(request, "ss", "org.freedesktop.login1.Session", "LockedHint") < 0 ||
             sd_bus_call_async(m->bus, &s->lock_query, request, on_locked_hint, s, 2000000) < 0) {
                 trust_session_set_lock(&s->state, -1);
-                trust_session_invalidate_verification(&s->state);
+                invalidate_session_verification(s);
         }
 }
 
@@ -926,8 +943,9 @@ static void query_preparing_for_sleep(Manager *m);
 
 static void set_preparing_for_sleep(Manager *m, int preparing) {
         m->preparing_for_sleep = preparing;
+        invalidate_verification_epoch(m);
         for (TrackedSession *s = m->sessions; s; s = s->next)
-                trust_session_invalidate_verification(&s->state);
+                invalidate_session_verification(s);
 }
 
 static void forget_sleep_state(Manager *m) {
@@ -980,6 +998,7 @@ static void query_preparing_for_sleep(Manager *m) {
 }
 
 static void forget_sessions(Manager *m) {
+        invalidate_verification_epoch(m);
         m->session_query = sd_bus_slot_unref(m->session_query);
         m->session_retry = sd_event_source_unref(m->session_retry);
         while (m->sessions)
@@ -1043,7 +1062,7 @@ update:
         s->lock_query = sd_bus_slot_unref(s->lock_query);
         trust_session_set_lock(&s->state, locked);
         if (locked != 0)
-                trust_session_invalidate_verification(&s->state);
+                invalidate_session_verification(s);
         {
                 _cleanup_(sd_json_variant_unrefp) sd_json_variant *payload = NULL;
 
@@ -1276,6 +1295,30 @@ static int json_string_parameter(
         return trust_text_valid(*ret, max) ? 0 : -EINVAL;
 }
 
+static void append_auth_event(Manager *m, AuthEvent *e) {
+        e->next = m->events;
+        m->events = e;
+        m->n_events++;
+        sd_journal_send("MESSAGE=platform-authentication event recorded",
+                        "PLATFORMD_EVENT=auth-event",
+                        "PLATFORMD_AUTH_USER=%s", e->user ?: "",
+                        "PLATFORMD_AUTH_SESSION=%s", e->session ?: "",
+                        "PLATFORMD_AUTH_METHOD=%s", e->method ?: "",
+                        "PLATFORMD_AUTH_RESULT=%s", e->result ?: "",
+                        "PLATFORMD_AUTH_FRESHNESS=%s",
+                        e->qualifies_for_freshness ? "yes" : "no",
+                        NULL);
+        if (m->n_events > AUTH_EVENTS_MAX) {
+                AuthEvent **pp = &m->events;
+
+                while ((*pp)->next)
+                        pp = &(*pp)->next;
+                auth_event_free(*pp);
+                *pp = NULL;
+                m->n_events--;
+        }
+}
+
 static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                                 sd_varlink_method_flags_t flags, void *userdata) {
         Manager *m = manager_instance;
@@ -1363,23 +1406,11 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                 m->preparing_for_sleep == 0 &&
                 trust_auth_event_qualifies(service, phase, method, result);
 
-        e->next = m->events;
-        m->events = e;
-        m->n_events++;
-
-        if (e->qualifies_for_freshness && tracked)
+        if (e->qualifies_for_freshness && tracked) {
                 trust_session_record_verification(&tracked->state, e->timestamp.boottime_usec,
                                                    e->timestamp.realtime_usec);
-
-        sd_journal_send("MESSAGE=platform-authentication event recorded",
-                        "PLATFORMD_EVENT=auth-event",
-                        "PLATFORMD_AUTH_USER=%s", e->user ?: "",
-                        "PLATFORMD_AUTH_SESSION=%s", e->session ?: "",
-                        "PLATFORMD_AUTH_METHOD=%s", e->method ?: "",
-                        "PLATFORMD_AUTH_RESULT=%s", e->result ?: "",
-                        "PLATFORMD_AUTH_FRESHNESS=%s",
-                        e->qualifies_for_freshness ? "yes" : "no",
-                        NULL);
+        }
+        append_auth_event(m, e);
 
         if (auth_event_to_json(e, &payload) < 0 ||
             sd_json_variant_set_field_unsigned(&payload, "peerUid", peer) < 0)
@@ -1388,17 +1419,135 @@ static int vl_submit_auth_event(sd_varlink *link, sd_json_variant *parameters,
                 record_runtime_event(m, &e->timestamp, "authentication", "io.platformd.Trust.SubmitAuthEvent",
                                      "declared", payload);
 
-        if (m->n_events > AUTH_EVENTS_MAX) {
-                AuthEvent **pp = &m->events;
-                while ((*pp)->next)
-                        pp = &(*pp)->next;
-                auth_event_free(*pp);
-                *pp = NULL;
-                m->n_events--;
-        }
-
         if ((r = sd_json_variant_new_object(&empty, NULL, 0)) < 0)
                 return r;
+        return sd_varlink_reply(link, empty);
+}
+
+static bool verification_context_valid(sd_json_variant *context) {
+        static const char * const fields[] = { "challengeHex", "audience", "operationDigestHex" };
+
+        if (!sd_json_variant_is_object(context) || sd_json_variant_elements(context) != 6)
+                return false;
+        for (size_t i = 0; i < sizeof fields / sizeof fields[0]; i++) {
+                sd_json_variant *value = sd_json_variant_by_key(context, fields[i]);
+                const char *text;
+                size_t n;
+
+                if (!sd_json_variant_is_string(value))
+                        return false;
+                text = sd_json_variant_string(value);
+                n = strlen(text);
+                if (i == 1) {
+                        if (n == 0 || n > 256)
+                                return false;
+                        for (size_t j = 0; j < n; j++)
+                                if ((unsigned char) text[j] < 0x20 || (unsigned char) text[j] > 0x7e)
+                                        return false;
+                } else {
+                        if (n != 64)
+                                return false;
+                        for (size_t j = 0; j < n; j++)
+                                if (!((text[j] >= '0' && text[j] <= '9') || (text[j] >= 'a' && text[j] <= 'f')))
+                                        return false;
+                }
+        }
+        return true;
+}
+
+static bool verification_unsigned(sd_json_variant *value) {
+        sd_json_variant_type_t type = sd_json_variant_type(value);
+
+        return (type == SD_JSON_VARIANT_INTEGER || type == SD_JSON_VARIANT_UNSIGNED) &&
+               sd_json_variant_is_unsigned(value);
+}
+
+static int vl_submit_verification_event(sd_varlink *link, sd_json_variant *parameters,
+                                       sd_varlink_method_flags_t flags, void *userdata) {
+        Manager *m = manager_instance;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *empty = NULL, *payload = NULL;
+        _cleanup_free_ char *class = NULL, *session_user = NULL, *session_state = NULL;
+        const char *user, *session;
+        sd_json_variant *p, *context;
+        uint64_t uid_value, verification_boot, verification_real;
+        RuntimeTimestamp now;
+        TrackedSession *tracked;
+        AuthEvent *e;
+        uid_t peer, session_uid;
+        int r;
+
+        if (sd_varlink_get_peer_uid(link, &peer) < 0 || peer != 0)
+                return sd_varlink_error(link, "io.platformd.Trust.PermissionDenied", NULL);
+        if (json_string_parameter(parameters, "user", AUTH_USER_MAX, &user) < 0 || !*user)
+                return sd_varlink_error_invalid_parameter_name(link, "user");
+        if (json_string_parameter(parameters, "sessionId", AUTH_SESSION_MAX, &session) < 0 || !*session)
+                return sd_varlink_error_invalid_parameter_name(link, "sessionId");
+        p = sd_json_variant_by_key(parameters, "uid");
+        if (!verification_unsigned(p) || (uid_value = sd_json_variant_unsigned(p)) > (uint64_t) (uid_t) -2)
+                return sd_varlink_error_invalid_parameter_name(link, "uid");
+        context = sd_json_variant_by_key(parameters, "context");
+        if (!verification_context_valid(context))
+                return sd_varlink_error_invalid_parameter_name(link, "context");
+        p = sd_json_variant_by_key(parameters, "verificationBoottimeUSec");
+        if (!verification_unsigned(p) || (verification_boot = sd_json_variant_unsigned(p)) == 0)
+                return sd_varlink_error_invalid_parameter_name(link, "verificationBoottimeUSec");
+        p = sd_json_variant_by_key(parameters, "verificationRealtimeUSec");
+        if (!verification_unsigned(p) || (verification_real = sd_json_variant_unsigned(p)) == 0)
+                return sd_varlink_error_invalid_parameter_name(link, "verificationRealtimeUSec");
+        r = runtime_timestamp_now(&now);
+        if (r < 0)
+                return r;
+        if (verification_boot > now.boottime_usec || now.boottime_usec - verification_boot >= UINT64_C(120000000) ||
+            verification_real > now.realtime_usec || now.realtime_usec - verification_real >= UINT64_C(120000000))
+                return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
+        if (sd_session_get_uid(session, &session_uid) < 0)
+                return sd_varlink_error(link, "io.platformd.Trust.NoSuchSession", NULL);
+        if (session_uid != (uid_t) uid_value ||
+            sd_session_get_username(session, &session_user) < 0 || !streq(user, session_user) ||
+            sd_session_get_class(session, &class) < 0 || !trust_session_class_allowed(class) ||
+            sd_session_get_state(session, &session_state) < 0 || !streq(session_state, "active") ||
+            sd_session_is_active(session) <= 0 || sd_session_is_remote(session) != 0)
+                return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
+        tracked = ensure_tracked_session(m, session);
+        if (!tracked || tracked->state.lock_state != 0 || m->preparing_for_sleep != 0 ||
+            verification_boot <= m->verification_invalidated_usec ||
+            verification_boot <= tracked->verification_invalidated_usec)
+                return sd_varlink_error(link, "io.platformd.Trust.InvalidAuthEvent", NULL);
+
+        e = calloc(1, sizeof *e);
+        if (!e)
+                return -ENOMEM;
+        e->user = strdup(user);
+        e->service = strdup("platformd-verify");
+        e->phase = strdup("verify");
+        e->method = strdup("platformd-verify");
+        e->result = strdup("success");
+        e->session = strdup(session);
+        e->uid = (uid_t) uid_value;
+        e->timestamp = now;
+        e->qualifies_for_freshness = true;
+        if (!e->user || !e->service || !e->phase || !e->method || !e->result || !e->session) {
+                auth_event_free(e);
+                return -ENOMEM;
+        }
+        r = auth_event_to_json(e, &payload);
+        if (r >= 0)
+                r = sd_json_variant_merge_objectbo(&payload,
+                        SD_JSON_BUILD_PAIR_UNSIGNED("peerUid", peer),
+                        SD_JSON_BUILD_PAIR_VARIANT("context", context),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("verificationBoottimeUSec", verification_boot),
+                        SD_JSON_BUILD_PAIR_UNSIGNED("verificationRealtimeUSec", verification_real));
+        if (r >= 0)
+                r = sd_json_variant_new_object(&empty, NULL, 0);
+        if (r < 0) {
+                auth_event_free(e);
+                return r;
+        }
+        if (verification_boot > tracked->state.last_verification_boottime_usec) {
+                trust_session_record_verification(&tracked->state, verification_boot, verification_real);
+        }
+        append_auth_event(m, e);
+        record_runtime_event(m, &now, "authentication", "io.platformd.Trust.SubmitVerificationEvent", "declared", payload);
         return sd_varlink_reply(link, empty);
 }
 
@@ -2113,6 +2262,7 @@ static int setup_varlink(Manager *m) {
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.GetUserIdentity", vl_get_user_identity)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.EvaluatePolicy", vl_evaluate_policy)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.SubmitAuthEvent", vl_submit_auth_event)) < 0 ||
+            (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.SubmitVerificationEvent", vl_submit_verification_event)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.ListAuthEvents", vl_list_auth_events)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.GetRuntimeLog", vl_get_runtime_log)) < 0 ||
             (r = sd_varlink_server_bind_method(m->varlink, "io.platformd.Trust.Attest", vl_attest)) < 0 ||

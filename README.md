@@ -8,7 +8,7 @@ The package provides:
 
 * `platformd-trustd`, the system service and `io.platformd.Trust` Varlink
   interface
-* `trustctl`, the command line client and offline attestation verifier
+* `trustctl`, the command line client, offline verifier, and enrollment tool
 * `pam_platformd.so`, a PAM module for submitting session records and evaluating
   trust policies
 
@@ -19,7 +19,8 @@ The service does not authenticate users, store credentials, or grant access.
 The build requires libsystemd 257 or newer, OpenSSL 3.0 or newer, Meson 1.1 or
 newer, Ninja, and a C11 compiler. TPM attestation additionally requires
 tss2-esys, tss2-mu, and tss2-tctildr. The PAM module requires libpam. Boot reference
-provisioning requires `systemd-measure`.
+provisioning requires `systemd-measure`. Verifier-side enrollment requires
+`tpm2_makecredential`.
 
 ## Building
 
@@ -52,8 +53,9 @@ establish freshness.
 Attestation production is unavailable when the package is built without TPM2-TSS
 or the system has no usable TPM. Offline verification requires an independently
 supplied attestation key and challenge, but no TPM or running service.
-Authentication events remain declared evidence even
-when they are included in a TPM protected runtime measurement log.
+Stateful verification requires explicit enrollment, approved boot references,
+and an application request. Authentication events remain declared evidence
+even when they are included in a TPM protected runtime measurement log.
 
 The runtime log requires explicit NV index initialization. Attestation uses a
 platformd-specific JSON envelope, not an IETF Entity Attestation Token.

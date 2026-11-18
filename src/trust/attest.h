@@ -25,11 +25,10 @@ int attest_quote(const uint8_t *nonce, size_t nonce_len,
                  uint8_t **quoted, size_t *quoted_len,
                  uint8_t **sig, size_t *sig_len);
 
-/* The runtime auth log lives in an extend-only NV index (append-only within a
- * boot; not resettable at locality 0 like an application PCR). Read the current
- * value, extend it with an event (TPM computes H(old || data)), and produce an
- * AK-signed certification of the value bound to a nonce. value_out is 32 bytes;
- * the certify outputs are malloc'd. Return 0 or a negative errno-style code. */
+/* The runtime log uses a root-controlled extend-only NV index. Measurement does
+ * not protect against a privileged caller replacing the index. The TPM extends
+ * H(old || data) and certifies the value under the AK and supplied nonce.
+ * value_out is 32 bytes; certification outputs are malloc'd. */
 int attest_nv_read(uint8_t value_out[32]);
 int attest_nv_initialize(void);
 int attest_nv_public(uint8_t **ret, size_t *ret_size);

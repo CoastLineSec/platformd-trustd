@@ -21,7 +21,10 @@
 #include <systemd/sd-varlink.h>
 
 #include "pe.h"
+#include "attestation-appraise.h"
 #include "attestation-verify.h"
+#include "attestation-request.h"
+#include "enrollment.h"
 
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
@@ -368,15 +371,15 @@ static int cmd_attest_token(const char *nonce_arg) {
         return EXIT_SUCCESS;
 }
 
-static int read_attestation_file(const char *path, size_t limit, char **ret) {
+static int read_attestation_file_full(const char *path, size_t limit, bool private, char **ret) {
         _cleanup_free_ char *buffer = NULL;
         struct stat st;
-        size_t size, offset = 0;
+        size_t size = 0, offset = 0;
         int fd, r = 0;
-        char extra;
+        char extra = 0;
         ssize_t n;
 
-        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK | (private ? O_NOFOLLOW : 0));
         if (fd < 0)
                 return -errno;
         if (fstat(fd, &st) < 0) {
@@ -385,6 +388,10 @@ static int read_attestation_file(const char *path, size_t limit, char **ret) {
         }
         if (!S_ISREG(st.st_mode) || st.st_size <= 0 || (uintmax_t) st.st_size > limit) {
                 r = -EINVAL;
+                goto finish;
+        }
+        if (private && (st.st_uid != geteuid() || (st.st_mode & 07777) != 0600 || st.st_nlink != 1)) {
+                r = -EPERM;
                 goto finish;
         }
         size = (size_t) st.st_size;
@@ -418,8 +425,153 @@ static int read_attestation_file(const char *path, size_t limit, char **ret) {
         *ret = buffer;
         buffer = NULL;
 finish:
+        if (private) {
+                if (buffer)
+                        explicit_bzero(buffer, size + 1);
+                explicit_bzero(&extra, sizeof extra);
+        }
         close(fd);
         return r;
+}
+
+static int read_attestation_file(const char *path, size_t limit, char **ret) {
+        return read_attestation_file_full(path, limit, false, ret);
+}
+
+static char *strip_space(char *text) {
+        char *end;
+
+        while (isspace((unsigned char) *text))
+                text++;
+        end = text + strlen(text);
+        while (end > text && isspace((unsigned char) end[-1]))
+                *--end = 0;
+        return text;
+}
+
+static int parse_lifetime(const char *text, uint64_t *ret) {
+        uint64_t value = 0;
+
+        if (!text || !*text)
+                return -EINVAL;
+        for (const char *p = text; *p; p++) {
+                if (*p < '0' || *p > '9' || value > 600)
+                        return -EINVAL;
+                value = value * 10 + (unsigned) (*p - '0');
+        }
+        if (value == 0 || value > 600)
+                return -EINVAL;
+        *ret = value;
+        return 0;
+}
+
+static int cmd_enrollment(const char *command, int argc, char **argv) {
+        enum {
+                STATE, EK, LIFETIME, REQUEST_ID, RESPONSE, REQUEST, TOKEN, REFERENCE, PHASE, DECLARED, _OPTION_MAX,
+        };
+        static const char * const names[] = {
+                "--state-dir=", "--endorsement-key=", "--lifetime=", "--request-id=", "--response=",
+                "--request=", "--token=", "--reference=", "--phase=", "--allow-root-declared-authentication",
+        };
+        const char *options[_OPTION_MAX] = {}, *argument = NULL;
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *input = NULL, *reference = NULL, *request = NULL, *report = NULL;
+        _cleanup_free_ char *text = NULL, *key = NULL, *reference_text = NULL;
+        char *response = NULL;
+        Enrollment *enrollment = NULL;
+        unsigned allowed = 1U << STATE, seen = 0;
+        uint64_t lifetime = 0;
+        int r = -EINVAL;
+
+        if (streq(command, "enrollment-begin"))
+                allowed |= (1U << EK) | (1U << LIFETIME);
+        else if (streq(command, "enrollment-complete"))
+                allowed |= (1U << REQUEST_ID) | (1U << RESPONSE);
+        else if (streq(command, "request-begin"))
+                allowed |= (1U << REQUEST) | (1U << LIFETIME);
+        else if (streq(command, "request-complete"))
+                allowed |= (1U << REQUEST_ID) | (1U << TOKEN) | (1U << REFERENCE) | (1U << PHASE) | (1U << DECLARED);
+        else if (!streq(command, "enrollment-status") && !streq(command, "enrollment-revoke"))
+                goto finish;
+        for (int i = 0; i < argc; i++) {
+                size_t j;
+
+                if (argv[i][0] != '-' && !argument) {
+                        argument = argv[i];
+                        continue;
+                }
+                for (j = 0; j < _OPTION_MAX; j++) {
+                        size_t n = strlen(names[j]);
+
+                        if ((j == DECLARED ? streq(argv[i], names[j]) : strncmp(argv[i], names[j], n) == 0) &&
+                            (allowed & (1U << j)) && !(seen & (1U << j))) {
+                                options[j] = argv[i] + n;
+                                if (j != DECLARED && !*options[j])
+                                        goto finish;
+                                seen |= 1U << j;
+                                break;
+                        }
+                }
+                if (j == _OPTION_MAX)
+                        goto finish;
+        }
+        if (!argument || !*argument || seen != allowed)
+                goto finish;
+        if ((allowed & (1U << LIFETIME)) && parse_lifetime(options[LIFETIME], &lifetime) < 0)
+                goto finish;
+
+        if (streq(command, "enrollment-begin")) {
+                r = read_attestation_file(argument, 16384, &text);
+                if (r >= 0)
+                        r = read_attestation_file(options[EK], 4096, &key);
+                if (r >= 0)
+                        r = sd_json_parse(text, 0, &input, NULL, NULL);
+                if (r >= 0)
+                        r = enrollment_begin(options[STATE], input, strip_space(key), lifetime, &report);
+        } else if (streq(command, "enrollment-complete")) {
+                r = read_attestation_file_full(options[RESPONSE], 256, true, &response);
+                if (r >= 0)
+                        r = enrollment_complete(options[STATE], argument, options[REQUEST_ID], strip_space(response), &report);
+        } else if (streq(command, "enrollment-status"))
+                r = enrollment_status(options[STATE], argument, &report);
+        else if (streq(command, "enrollment-revoke"))
+                r = enrollment_revoke(options[STATE], argument, &report);
+        else if (streq(command, "request-begin")) {
+                r = read_attestation_file(options[REQUEST], 4096, &text);
+                if (r >= 0)
+                        r = sd_json_parse(text, 0, &input, NULL, NULL);
+                if (r >= 0)
+                        r = enrollment_request_begin(options[STATE], argument, input, lifetime, &report);
+        } else {
+                r = enrollment_request_consume(options[STATE], argument, options[REQUEST_ID], &enrollment, &request);
+                if (r >= 0)
+                        r = read_attestation_file(options[TOKEN], ATTESTATION_TOKEN_SIZE_MAX, &text);
+                if (r >= 0)
+                        r = read_attestation_file(options[REFERENCE], ATTESTATION_REFERENCE_SIZE_MAX, &reference_text);
+                if (r >= 0)
+                        r = sd_json_parse(text, 0, &input, NULL, NULL);
+                if (r >= 0)
+                        r = sd_json_parse(reference_text, 0, &reference, NULL, NULL);
+                if (r >= 0)
+                        r = attestation_appraise_request(input, enrollment_attestation_key(enrollment), request, reference, options[PHASE], &report);
+                if (r >= 0)
+                        r = sd_json_variant_merge_objectbo(&report,
+                                SD_JSON_BUILD_PAIR_STRING("keyId", argument),
+                                SD_JSON_BUILD_PAIR_BOOLEAN("activeEnrollmentMatched", true),
+                                SD_JSON_BUILD_PAIR_BOOLEAN("singleUseChallengeConsumed", true));
+        }
+finish:
+        if (response) {
+                explicit_bzero(response, strlen(response));
+                free(response);
+        }
+        if (r >= 0)
+                r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        if (r >= 0 && fflush(stdout) != 0)
+                r = -EIO;
+        enrollment_release(enrollment);
+        if (r < 0)
+                fprintf(stderr, "trustctl: %s failed: %s\n", command, strerror(-r));
+        return r < 0 ? EXIT_FAILURE : EXIT_SUCCESS;
 }
 
 static int cmd_verify_attestation(int argc, char **argv) {
@@ -465,6 +617,69 @@ static int cmd_verify_attestation(int argc, char **argv) {
                 r = attestation_verify(token, key, nonce, &report);
         if (r < 0) {
                 fprintf(stderr, "trustctl: attestation verification failed: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
+        if (r < 0 || fflush(stdout) != 0)
+                return EXIT_FAILURE;
+        return EXIT_SUCCESS;
+}
+
+static int cmd_appraise_attestation(int argc, char **argv) {
+        _cleanup_(sd_json_variant_unrefp) sd_json_variant *token = NULL, *reference = NULL, *report = NULL;
+        _cleanup_free_ char *text = NULL, *key_text = NULL, *reference_text = NULL;
+        const char *path = NULL, *key_path = NULL, *nonce = NULL, *reference_path = NULL, *phase = NULL;
+        char *key, *end;
+        int r;
+
+        for (int i = 0; i < argc; i++)
+                if (strncmp(argv[i], "--attestation-key=", 18) == 0 && !key_path)
+                        key_path = argv[i] + 18;
+                else if (strncmp(argv[i], "--nonce=", 8) == 0 && !nonce)
+                        nonce = argv[i] + 8;
+                else if (strncmp(argv[i], "--reference=", 12) == 0 && !reference_path)
+                        reference_path = argv[i] + 12;
+                else if (strncmp(argv[i], "--phase=", 8) == 0 && !phase)
+                        phase = argv[i] + 8;
+                else if (argv[i][0] != '-' && !path)
+                        path = argv[i];
+                else {
+                        fprintf(stderr, "trustctl: unknown or repeated appraisal argument\n");
+                        return EXIT_FAILURE;
+                }
+        if (!path || !*path || !key_path || !*key_path || !nonce || !*nonce ||
+            !reference_path || !*reference_path || !phase || !*phase) {
+                fprintf(stderr, "trustctl: appraisal requires a token file, --attestation-key=FILE, --nonce=HEX, --reference=FILE, and --phase=STRING\n");
+                return EXIT_FAILURE;
+        }
+        r = read_attestation_file(path, ATTESTATION_TOKEN_SIZE_MAX, &text);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: cannot read attestation: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        r = read_attestation_file(key_path, 4096, &key_text);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: cannot read attestation key: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        r = read_attestation_file(reference_path, ATTESTATION_REFERENCE_SIZE_MAX, &reference_text);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: cannot read approved reference: %s\n", strerror(-r));
+                return EXIT_FAILURE;
+        }
+        key = key_text;
+        while (isspace((unsigned char) *key))
+                key++;
+        end = key + strlen(key);
+        while (end > key && isspace((unsigned char) end[-1]))
+                *--end = 0;
+        r = sd_json_parse(text, 0, &token, NULL, NULL);
+        if (r >= 0)
+                r = sd_json_parse(reference_text, 0, &reference, NULL, NULL);
+        if (r >= 0)
+                r = attestation_appraise(token, key, nonce, reference, phase, &report);
+        if (r < 0) {
+                fprintf(stderr, "trustctl: attestation appraisal failed: %s\n", strerror(-r));
                 return EXIT_FAILURE;
         }
         r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
@@ -813,7 +1028,15 @@ static void usage(void) {
                "  trustctl attest-token [nonceHex]  Platformd attestation evidence envelope\n"
                "  trustctl verify-attestation FILE --attestation-key=FILE --nonce=HEX\n"
                "                                  Verify evidence against an expected key and challenge\n"
+               "  trustctl appraise-attestation FILE --attestation-key=FILE --nonce=HEX --reference=FILE --phase=STRING\n"
+               "                                  Compare verified PCR 11 against an approved reference\n"
                "  trustctl enroll                   EK/AK enrollment evidence (credential activation)\n"
+               "  trustctl enrollment-begin FILE --state-dir=DIR --endorsement-key=FILE --lifetime=SECONDS\n"
+               "  trustctl enrollment-complete KEY --state-dir=DIR --request-id=HEX --response=FILE\n"
+               "  trustctl enrollment-status KEY --state-dir=DIR\n"
+               "  trustctl enrollment-revoke KEY --state-dir=DIR\n"
+               "  trustctl request-begin KEY --state-dir=DIR --request=FILE --lifetime=SECONDS\n"
+               "  trustctl request-complete KEY --state-dir=DIR --request-id=HEX --token=FILE --reference=FILE --phase=STRING --allow-root-declared-authentication\n"
                "  trustctl activate-credential <cred> <secret>  Answer a MakeCredential challenge\n"
                "  trustctl list-sessions            All tracked logind sessions\n"
                "  trustctl session <id>             One session's trust record\n"
@@ -852,6 +1075,12 @@ int main(int argc, char *argv[]) {
                 return cmd_attest_token(argc > 2 ? argv[2] : NULL);
         if (streq(cmd, "verify-attestation"))
                 return cmd_verify_attestation(argc - 2, argv + 2);
+        if (streq(cmd, "appraise-attestation"))
+                return cmd_appraise_attestation(argc - 2, argv + 2);
+        if (streq(cmd, "enrollment-begin") || streq(cmd, "enrollment-complete") ||
+            streq(cmd, "enrollment-status") || streq(cmd, "enrollment-revoke") ||
+            streq(cmd, "request-begin") || streq(cmd, "request-complete"))
+                return cmd_enrollment(cmd, argc - 2, argv + 2);
         if (streq(cmd, "enroll"))
                 return cmd_enroll();
         if (streq(cmd, "activate-credential") && argc > 3)

@@ -47,8 +47,9 @@
     root. The daemon restricts evidence production because it is a signing
     operation on the shared TPM. <command>provision</command> and
     <command>remove-boot-reference</command> require privilege to update boot
-    references. <command>verify-attestation</command> verifies supplied evidence
-    offline and requires neither privilege, a running daemon, nor a TPM.</para>
+    references. <command>verify-attestation</command> and
+    <command>appraise-attestation</command> process supplied evidence offline and
+    require neither privilege, a running daemon, nor a TPM.</para>
   </refsect1>
 
   <refsect1>
@@ -151,6 +152,155 @@
         it contains no authentication evidence. The requester must generate,
         expire, and consume its challenges. Reusing a challenge is not detected
         by this command.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>appraise-attestation</command> <replaceable>FILE</replaceable>
+        <option>--attestation-key=<replaceable>FILE</replaceable></option>
+        <option>--nonce=<replaceable>HEX</replaceable></option>
+        <option>--reference=<replaceable>FILE</replaceable></option>
+        <option>--phase=<replaceable>STRING</replaceable></option></term>
+        <listitem><para>Verify an attestation envelope as described for
+        <command>verify-attestation</command>, then compare its SHA-256 PCR 11
+        value against an independently approved reference for the specified
+        phase. All options are required. No local reference directory is
+        consulted.</para>
+
+        <para>The reference is a regular JSON file limited to 1 MiB, in the
+        format produced by <command>systemd-measure calculate --bank=sha256
+        --phase=STRING --json=short</command>. The root object contains only
+        <literal>sha256</literal>, an array of 1 through 1024 objects. Each object
+        contains exactly <literal>phase</literal>, <literal>pcr</literal>, and
+        <literal>hash</literal>: a nonempty phase string of at most 1024 bytes
+        without ASCII control characters, the integer 11, and a 32-byte digest
+        encoded as hexadecimal. Duplicate keys and unsupported banks or PCRs
+        are rejected. Every candidate is validated. At least one candidate
+        must match both the requested phase and the verified PCR value.</para>
+
+        <para>Print the verification checks, retained event count,
+        <literal>approvedPcr11Matched</literal>, and <literal>approvedPhase</literal>
+        as JSON on success. No result is printed on failure. Approval applies
+        only to PCR 11 for the selected phase. It does not establish approved
+        firmware, Secure Boot policy, the complete running system, key
+        enrollment, or authentication freshness. The caller selects the key,
+        reference, and phase independently of the submitted token, and owns
+        challenge expiry and single-use enforcement.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>enrollment-begin</command> <replaceable>FILE</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--endorsement-key=<replaceable>FILE</replaceable></option>
+        <option>--lifetime=<replaceable>SECONDS</replaceable></option></term>
+        <listitem><para>Create a credential-activation challenge for the exact
+        JSON object returned by <function>GetEnrollment</function>. The
+        independently provisioned endorsement-key file contains a hexadecimal
+        marshaled <constant>TPM2B_PUBLIC</constant>. The evidence is not a trust
+        anchor. This command supports the platformd ECC P-256 key templates
+        and requires <command>tpm2_makecredential</command>. It does not access
+        a local TPM.</para>
+
+        <para>The state directory must already exist, be absolute, owned by
+        the effective user, and have mode 0700. Symlink path components are
+        rejected. State files have mode 0600. No default directory, device
+        identity, certificate authority, or account association is selected.
+        The lifetime must be 1 through 600 seconds. Expiry uses the verifier's
+        suspend-aware clock and boot ID. Only a hash of the expected response
+        is retained.</para>
+
+        <para>Print the key identifier, request identifier, credential, and
+        encrypted secret as JSON. The key identifier is SHA-256 of the complete
+        marshaled Attestation Key public area. An active, revoked, or unexpired
+        pending enrollment cannot be replaced. An inactive enrollment retains
+        its original key pins.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>enrollment-complete</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--request-id=<replaceable>HEX</replaceable></option>
+        <option>--response=<replaceable>FILE</replaceable></option></term>
+        <listitem><para>Complete the matching credential-activation challenge.
+        The response file contains 32 hexadecimal-encoded bytes recovered by
+        the attester. It must be a regular file owned by the effective user,
+        with mode 0600, one hard link, and no final symlink. Never place the
+        response in a command argument or environment variable.</para>
+
+        <para>An unreadable or unsafe response file is rejected before the
+        response is submitted to the enrollment store.</para>
+
+        <para>A matching attempt consumes the pending challenge, including an
+        incorrect response, expiry, or a verifier reboot. A different request
+        identifier does not consume the current challenge. Success activates
+        the enrollment under the provisioned endorsement-key pin. Credential
+        activation does not validate a manufacturer certificate or establish
+        its provenance.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>enrollment-status</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option></term>
+        <term><command>enrollment-revoke</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option></term>
+        <listitem><para>Inspect or revoke an enrollment. Revocation is durable
+        and removes pending authentication requests. Revoked keys cannot be
+        reactivated. A replacement Attestation Key requires a separate
+        enrollment; no device or account relationship is inferred. Concurrent
+        access that conflicts with a held state lock fails with
+        <constant>EBUSY</constant>.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>request-begin</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--request=<replaceable>FILE</replaceable></option>
+        <option>--lifetime=<replaceable>SECONDS</replaceable></option></term>
+        <listitem><para>Create one expiring authentication request for an active
+        enrollment. The regular JSON input file, limited to 4096 bytes, contains
+        exactly <literal>uid</literal>, <literal>sessionId</literal>,
+        <literal>audience</literal>, and <literal>operationDigestHex</literal>.
+        The UID is an integer less than 4294967295. Session and audience are
+        nonempty printable ASCII strings of at most 256 bytes. The operation
+        digest is 32 bytes in lowercase hexadecimal. Its input encoding and
+        account mapping are defined by the application, not by trustd.</para>
+
+        <para>Print a request containing a random 32-byte challenge. Pass its
+        nested <literal>request.context</literal> object to
+        <command>verifyctl verify-context</command> on the attester, then obtain
+        an attestation token with the same challenge. The lifetime is 1 through
+        600 seconds, measured by the verifier. An unexpired pending request
+        cannot be overwritten.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
+        <term><command>request-complete</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--request-id=<replaceable>HEX</replaceable></option>
+        <option>--token=<replaceable>FILE</replaceable></option>
+        <option>--reference=<replaceable>FILE</replaceable></option>
+        <option>--phase=<replaceable>STRING</replaceable></option>
+        <option>--allow-root-declared-authentication</option></term>
+        <listitem><para>Consume a matching unexpired request and appraise its
+        evidence under the active enrollment. Consumption is durable before
+        appraisal; malformed evidence, an unapproved reference, or a missing
+        authentication declaration cannot be retried with the same request.
+        A verifier reboot, expiry, or revocation invalidates the request.</para>
+
+        <para>Require valid TPM evidence, the request challenge in both TPM
+        structures, approved PCR 11 for the selected phase, and an exact
+        measured <function>SubmitVerificationEvent</function> declaration for
+        the requested UID, session, audience, and operation digest. A later
+        retained lock invalidation for that session, or any sleep invalidation,
+        rejects the declaration. Missing or unmeasured declarations fail closed.
+        The explicit policy option accepts the privileged host's declaration
+        of PAM completion. It does not prove a particular factor, user consent,
+        application identity, or the integrity of the privileged host.</para>
+
+        <para>Print a successful appraisal as JSON. Expiry and single use are
+        enforced by the verifier's state, not by device timestamps. The result
+        is a snapshot; the application must bind it to its authenticated
+        connection, account, and pending operation before granting access.
+        These commands provide no network listener or transport authentication.</para></listitem>
       </varlistentry>
 
       <varlistentry>

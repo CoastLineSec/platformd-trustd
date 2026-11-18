@@ -285,6 +285,25 @@ finish:
         return r;
 }
 
+int attestation_key_name(const char *ak_hex, uint8_t ret_name[static 34]) {
+        uint8_t encoded[256], qualified_name[34], name[34] = { 0, 0x0b };
+        EVP_PKEY *key = NULL;
+        int n, r;
+
+        n = unhex(ak_hex, encoded, sizeof encoded);
+        if (n < 0)
+                return n;
+        r = public_key((Bytes) { encoded, (size_t) n }, &key, qualified_name);
+        EVP_PKEY_free(key);
+        if (r < 0)
+                return r;
+        r = sha256((Bytes) { encoded + 2, (size_t) n - 2 }, name + 2);
+        if (r < 0)
+                return r;
+        memcpy(ret_name, name, sizeof name);
+        return 0;
+}
+
 static int signature_verify(EVP_PKEY *key, Bytes data, const char *signature) {
         uint8_t encoded[128];
         unsigned char *der = NULL;
@@ -528,6 +547,54 @@ static int authentication_payload(sd_json_variant *payload, bool login, uint64_t
         return 0;
 }
 
+static int verification_payload(sd_json_variant *payload, uint64_t boottime, uint64_t realtime,
+                                uint64_t *ret_observed) {
+        static const char * const fields[] = {
+                "user", "uid", "pamService", "tty", "remoteHost", "phase", "declaredMethod", "result",
+                "sessionId", "qualifiesForFreshness", "realtimeUSec", "evidenceQuality", "peerUid",
+                "context", "verificationBoottimeUSec", "verificationRealtimeUSec",
+        };
+        static const char * const context_fields[] = { "challengeHex", "audience", "operationDigestHex" };
+        sd_json_variant *context;
+        uint64_t uid, peer, copied_time, verification_boot, verification_real;
+        bool qualifies;
+
+        if (!object_fields(payload, fields, ELEMENTSOF(fields), true) ||
+            !text_field(payload, "user", 256, false) || !text_field(payload, "sessionId", 256, false) ||
+            !streq(string_field(payload, "pamService"), "platformd-verify") ||
+            !streq(string_field(payload, "declaredMethod"), "platformd-verify") ||
+            !streq(string_field(payload, "phase"), "verify") || !streq(string_field(payload, "result"), "success") ||
+            !streq(string_field(payload, "tty"), "") || !streq(string_field(payload, "remoteHost"), "") ||
+            !streq(string_field(payload, "evidenceQuality"), "declared") ||
+            !unsigned_field(payload, "uid", &uid) || uid >= UINT32_MAX ||
+            !unsigned_field(payload, "peerUid", &peer) || peer != 0 ||
+            !unsigned_field(payload, "realtimeUSec", &copied_time) || copied_time != realtime ||
+            !boolean_field(payload, "qualifiesForFreshness", &qualifies) || !qualifies ||
+            !unsigned_field(payload, "verificationBoottimeUSec", &verification_boot) || verification_boot == 0 ||
+            !unsigned_field(payload, "verificationRealtimeUSec", &verification_real) || verification_real == 0 ||
+            verification_boot > boottime || boottime - verification_boot >= UINT64_C(120000000) ||
+            verification_real > realtime || realtime - verification_real >= UINT64_C(120000000))
+                return -EBADMSG;
+        context = sd_json_variant_by_key(payload, "context");
+        if (!object_fields(context, context_fields, ELEMENTSOF(context_fields), true) ||
+            !text_field(context, "audience", 256, false))
+                return -EBADMSG;
+        for (const char *p = string_field(context, "audience"); *p; p++)
+                if ((unsigned char) *p > 0x7e)
+                        return -EBADMSG;
+        for (size_t i = 0; i < ELEMENTSOF(context_fields); i += 2) {
+                const char *hex = string_field(context, context_fields[i]);
+
+                if (!hex || strlen(hex) != 64)
+                        return -EBADMSG;
+                for (size_t j = 0; j < 64; j++)
+                        if (!((hex[j] >= '0' && hex[j] <= '9') || (hex[j] >= 'a' && hex[j] <= 'f')))
+                                return -EBADMSG;
+        }
+        *ret_observed = boottime;
+        return 0;
+}
+
 static int record_verify(sd_json_variant *record, uint64_t copied_time, char boot_id[33],
                          uint64_t *ret_observed) {
         static const char * const fields[] = {
@@ -565,6 +632,8 @@ static int record_verify(sd_json_variant *record, uint64_t copied_time, char boo
                         return authentication_payload(payload, false, boottime, realtime, ret_observed);
                 if (streq(source, "io.platformd.Trust.CompleteLoginAuthentication"))
                         return authentication_payload(payload, true, boottime, realtime, ret_observed);
+                if (streq(source, "io.platformd.Trust.SubmitVerificationEvent"))
+                        return verification_payload(payload, boottime, realtime, ret_observed);
                 return -EBADMSG;
         }
         if (!streq(quality, "observed"))

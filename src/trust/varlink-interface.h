@@ -106,6 +106,19 @@ static SD_VARLINK_DEFINE_METHOD(SubmitAuthEvent,
 static SD_VARLINK_DEFINE_METHOD(ListAuthEvents,
         SD_VARLINK_DEFINE_OUTPUT_BY_TYPE(events, AuthEvent, SD_VARLINK_ARRAY));
 
+static SD_VARLINK_DEFINE_STRUCT_TYPE(VerificationContext,
+        SD_VARLINK_DEFINE_FIELD(challengeHex, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_FIELD(audience, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_FIELD(operationDigestHex, SD_VARLINK_STRING, 0));
+
+static SD_VARLINK_DEFINE_METHOD(SubmitVerificationEvent,
+        SD_VARLINK_DEFINE_INPUT(user, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_INPUT(uid, SD_VARLINK_INT, 0),
+        SD_VARLINK_DEFINE_INPUT(sessionId, SD_VARLINK_STRING, 0),
+        SD_VARLINK_DEFINE_INPUT_BY_TYPE(context, VerificationContext, 0),
+        SD_VARLINK_DEFINE_INPUT(verificationBoottimeUSec, SD_VARLINK_INT, 0),
+        SD_VARLINK_DEFINE_INPUT(verificationRealtimeUSec, SD_VARLINK_INT, 0));
+
 static SD_VARLINK_DEFINE_STRUCT_TYPE(RuntimeEvent,
         SD_VARLINK_DEFINE_FIELD(description, SD_VARLINK_STRING, 0),
         SD_VARLINK_DEFINE_FIELD(digest, SD_VARLINK_STRING, 0),
@@ -172,6 +185,8 @@ static SD_VARLINK_DEFINE_INTERFACE(io_platformd_Trust, "io.platformd.Trust",
         &vl_method_EvaluatePolicy,
         &vl_type_AuthEvent,
         &vl_method_SubmitAuthEvent,
+        &vl_type_VerificationContext,
+        &vl_method_SubmitVerificationEvent,
         &vl_method_ListAuthEvents,
         &vl_type_RuntimeEvent,
         &vl_method_GetRuntimeLog,
