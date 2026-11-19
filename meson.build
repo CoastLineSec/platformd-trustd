@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: LGPL-2.1-or-later
 project('platformd', 'c',
-        version : '0.1.5',
+        version : '0.1.6',
         license : 'LGPL-2.1-or-later',
         meson_version : '>= 1.1',
         default_options : [

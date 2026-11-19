@@ -1,6 +1,45 @@
 platformd-trustd NEWS
 =====================
 
+CHANGES WITH 0.1.6:
+
+        Incompatible changes:
+
+        * GetAttestationToken() now returns a version 2 platformd JSON
+          envelope. The reply field remains named eat, but the envelope is not
+          an IETF Entity Attestation Token. The embedded TPM quote and NV
+          certification are signed; the envelope and local assertions are not.
+          Verifiers must use the version 2 runtime log replay rules.
+
+        Attestation:
+
+        * trustctl can now verify TPM evidence offline against a supplied
+          Attestation Key and challenge, and compare PCR 11 with an approved
+          systemd-measure reference. This comparison does not appraise
+          firmware or Secure Boot policy.
+
+        * Attestation Keys can now be enrolled through TPM credential
+          activation using a pinned Endorsement Key or an Endorsement Key
+          certificate validated against explicitly supplied trust roots and
+          revocation lists.
+
+        * Verifiers can now issue, cancel, and appraise single-use requests
+          bound to an enrolled key, UID, session, audience, and operation.
+          Appraisal requires a matching measured PAM completion record. The
+          record remains a declaration by root and does not establish user
+          consent or authorize the operation.
+
+        Session tracking and installation:
+
+        * Verification freshness is now also cleared when sleep preparation
+          ends or authoritative session state is lost. Incomplete logind
+          session enumeration is retried.
+
+        * Boot reference provisioning now fails if systemd-measure does not
+          support a measured section present in the UKI. The kernel-install
+          hook reports the failure and removes the affected entry’s stale
+          reference.
+
 CHANGES WITH 0.1.5:
 
         * Session lock state and verification freshness are now independent.
