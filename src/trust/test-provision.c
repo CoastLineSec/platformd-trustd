@@ -35,24 +35,21 @@ static sd_json_variant *read_reference(const char *id) {
         return reference;
 }
 
-int main(void) {
-        static const char *const sections[] = {
-                "linux", "osrel", "cmdline", "initrd", "ucode", "splash", "dtb", "uname", "sbat",
-                "pcrpkey", "dtbauto", "hwids", "profile", "efifw",
-        };
-        const size_t n_sections = sizeof sections / sizeof *sections;
+static const char *const sections[] = {
+        "linux", "osrel", "cmdline", "initrd", "ucode", "splash", "dtb", "uname", "sbat",
+        "pcrpkey", "dtbauto", "hwids", "profile", "efifw",
+};
+
+static void test_provision(size_t n_sections, bool supported) {
         char directory[] = "/tmp/platformd-provision.XXXXXX";
         char *args[3 + sizeof sections / sizeof *sections + 1] = {
-                "/usr/lib/systemd/systemd-measure", "calculate", "--bank=sha256",
+                SYSTEMD_MEASURE, "calculate", "--bank=sha256",
         };
         uint8_t image[4096] = {};
         size_t offset = 0x40 + 24 + n_sections * 40;
-        sd_json_variant *actual, *expected;
-        char *uki = NULL, *output = NULL;
+        _cleanup_free_ char *uki = NULL;
         FILE *f;
 
-        if (access(args[0], X_OK) < 0)
-                return 77;
         assert(mkdtemp(directory));
         assert(asprintf(&uki, "%s/test.efi", directory) >= 0);
         image[0] = 'M';
@@ -84,24 +81,45 @@ int main(void) {
         assert(f);
         assert(fwrite(image, 1, offset, f) == offset);
         assert(fclose(f) == 0);
-        assert(cmd_provision(uki, "actual") == EXIT_SUCCESS);
-        assert(run_capture(args, &output) == 0 && output);
-        assert(write_boot_reference(uki, "expected", output) == EXIT_SUCCESS);
-        actual = read_reference("actual");
-        expected = read_reference("expected");
-        assert(sd_json_variant_equal(sd_json_variant_by_key(actual, "pcr11"),
-                                     sd_json_variant_by_key(expected, "pcr11")));
-        sd_json_variant_unref(actual);
-        sd_json_variant_unref(expected);
-        assert(remove_boot_reference("actual") == EXIT_SUCCESS);
-        assert(remove_boot_reference("expected") == EXIT_SUCCESS);
+        if (supported) {
+                _cleanup_(sd_json_variant_unrefp) sd_json_variant *actual = NULL, *expected = NULL;
+                _cleanup_free_ char *output = NULL;
+
+                assert(cmd_provision(uki, "actual") == EXIT_SUCCESS);
+                assert(run_capture(args, &output) == 0 && output);
+                assert(write_boot_reference(uki, "expected", output) == EXIT_SUCCESS);
+                actual = read_reference("actual");
+                expected = read_reference("expected");
+                assert(sd_json_variant_equal(sd_json_variant_by_key(actual, "pcr11"),
+                                             sd_json_variant_by_key(expected, "pcr11")));
+                assert(remove_boot_reference("actual") == EXIT_SUCCESS);
+                assert(remove_boot_reference("expected") == EXIT_SUCCESS);
+        } else {
+                _cleanup_free_ char *dir = NULL, *path = NULL;
+
+                assert(cmd_provision(uki, "actual") == EXIT_FAILURE);
+                assert(boot_reference_path("actual", &dir, &path) >= 0);
+                assert(access(path, F_OK) < 0 && errno == ENOENT);
+        }
+
         assert(unlink(uki) == 0);
         for (size_t i = 0; i < n_sections; i++) {
                 assert(unlink(strchr(args[3 + i], '=') + 1) == 0);
                 free(args[3 + i]);
         }
         assert(rmdir(directory) == 0);
-        free(output);
-        free(uki);
+}
+
+int main(void) {
+        const size_t n_sections = sizeof sections / sizeof *sections;
+        char *help_args[] = { SYSTEMD_MEASURE, "--help", NULL };
+        _cleanup_free_ char *help = NULL;
+
+        if (access(SYSTEMD_MEASURE, X_OK) < 0)
+                return 77;
+
+        assert(run_capture(help_args, &help) == 0 && help);
+        test_provision(n_sections - 1, true);
+        test_provision(n_sections, strstr(help, "--efifw=") != NULL);
         return 0;
 }

@@ -400,7 +400,12 @@
         and record it for one boot entry. <replaceable>REFERENCE-ID</replaceable>
         defaults to the UKI filename. This is normally run by the
         <citerefentry><refentrytitle>kernel-install</refentrytitle><manvolnum>8</manvolnum></citerefentry>
-        plugin on each kernel installation.</para></listitem>
+        plugin on each kernel installation.</para>
+
+        <para>The installed measurement tool must support each measured section
+        present in the UKI. Images containing <literal>.efifw</literal> require
+        support for <option>--efifw=</option>. If calculation fails, no new
+        reference is written.</para></listitem>
       </varlistentry>
 
       <varlistentry>

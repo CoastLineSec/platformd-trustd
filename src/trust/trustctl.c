@@ -27,6 +27,8 @@
 #include "enrollment.h"
 #include "endorsement.h"
 
+#define SYSTEMD_MEASURE "/usr/lib/systemd/systemd-measure"
+
 #define streq(a, b) (strcmp((a), (b)) == 0)
 #define _cleanup_(f) __attribute__((cleanup(f)))
 static inline void freep(void *p) { free(*(void **) p); }
@@ -998,7 +1000,7 @@ static int cmd_provision(const char *uki, const char *reference_id) {
         char *measure_arg[sizeof secs / sizeof *secs] = {};
         _cleanup_free_ char *out = NULL;
         char *margv[3 + sizeof secs / sizeof *secs + 1];
-        int mc = 0, rc = EXIT_FAILURE, fd;
+        int mc = 0, rc = EXIT_FAILURE, fd, r;
         struct stat st;
         uint8_t *img;
         char *tmp;
@@ -1024,7 +1026,7 @@ static int cmd_provision(const char *uki, const char *reference_id) {
 
         /* Extract each UKI PE section, then drive systemd-measure over the ones
          * present. This is the computation systemd-stub uses for PCR 11. */
-        margv[mc++] = (char *) "/usr/lib/systemd/systemd-measure";
+        margv[mc++] = (char *) SYSTEMD_MEASURE;
         margv[mc++] = (char *) "calculate";
         margv[mc++] = (char *) "--bank=sha256";
         for (size_t i = 0; i < nsec; i++) {
@@ -1054,8 +1056,11 @@ static int cmd_provision(const char *uki, const char *reference_id) {
         munmap(img, (size_t) st.st_size);
         img = NULL;
 
-        if (run_capture(margv, &out) != 0 || !out)
-                fprintf(stderr, "trustctl: systemd-measure failed (is systemd-ukify installed?)\n");
+        r = run_capture(margv, &out);
+        if (r == 127)
+                fprintf(stderr, "trustctl: cannot execute %s\n", SYSTEMD_MEASURE);
+        else if (r != 0 || !out)
+                fprintf(stderr, "trustctl: systemd-measure could not calculate PCR 11 for %s\n", uki);
         else
                 rc = write_boot_reference(uki, reference_id, out);
 

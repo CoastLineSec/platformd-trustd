@@ -102,3 +102,38 @@ jobs:
           path: ${{ runner.temp }}/check/build/meson-logs/
           if-no-files-found: ignore
           retention-days: 7
+
+  debian:
+    name: verifier (Debian 13)
+    runs-on: ubuntu-latest
+    container: debian:trixie-slim
+    timeout-minutes: 20
+    steps:
+      - name: Install toolchain and dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          apt-get -o Acquire::Retries=3 update
+          apt-get -o Acquire::Retries=3 install -y --no-install-recommends \
+            ca-certificates git build-essential meson ninja-build pkg-config \
+            libsystemd-dev libssl-dev systemd openssl python3 tpm2-tools util-linux
+
+      - uses: actions/checkout@v4
+
+      - name: Check provisioning and verifier with Debian's systemd
+        run: |
+          /usr/lib/systemd/systemd-measure --version
+          meson setup "$RUNNER_TEMP/build" --prefix=/usr -Dwerror=true
+          meson test -C "$RUNNER_TEMP/build" --print-errorlogs \
+            pe provision kernel-install \
+            attestation-verify attestation-cli attestation-appraise attestation-appraise-cli \
+            attestation-request enrollment enrollment-cli endorsement endorsement-cli remote-consumer
+
+      - name: Preserve failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: logs-debian-13
+          path: ${{ runner.temp }}/build/meson-logs/
+          if-no-files-found: ignore
+          retention-days: 7
