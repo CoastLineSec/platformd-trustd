@@ -1367,6 +1367,30 @@ finish:
         return r;
 }
 
+int enrollment_request_cancel(const char *state_dir, const char *key_id, const char *request_id) {
+        Enrollment *e = NULL;
+        int r;
+
+        if (!identifier_valid(key_id, 64) || !identifier_valid(request_id, 64))
+                return -EINVAL;
+        r = active_open(state_dir, key_id, &e);
+        if (r < 0)
+                return r;
+        if (!e->record.request.id[0])
+                r = 0;
+        else if (!streq(request_id, e->record.request.id))
+                r = -ESTALE;
+        else if (e->record.generation == UINT64_MAX)
+                r = -EOVERFLOW;
+        else {
+                e->record.request = (AuthenticationRequest) {};
+                e->record.generation++;
+                r = record_save(e);
+        }
+        enrollment_release(e);
+        return r;
+}
+
 int enrollment_request_consume(const char *state_dir, const char *key_id, const char *request_id,
                                Enrollment **ret_enrollment, sd_json_variant **ret_request) {
         Enrollment *e = NULL;

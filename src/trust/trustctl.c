@@ -515,6 +515,8 @@ static int cmd_enrollment(const char *command, int argc, char **argv) {
                 allowed |= (1U << REQUEST_ID) | (1U << RESPONSE);
         else if (streq(command, "request-begin"))
                 allowed |= (1U << REQUEST) | (1U << LIFETIME);
+        else if (streq(command, "request-cancel"))
+                allowed |= 1U << REQUEST_ID;
         else if (streq(command, "request-complete"))
                 allowed |= (1U << REQUEST_ID) | (1U << TOKEN) | (1U << REFERENCE) | (1U << PHASE) | (1U << DECLARED);
         else if (!streq(command, "enrollment-status") && !streq(command, "enrollment-revoke"))
@@ -588,7 +590,9 @@ static int cmd_enrollment(const char *command, int argc, char **argv) {
                         r = sd_json_parse(text, 0, &input, NULL, NULL);
                 if (r >= 0)
                         r = enrollment_request_begin(options[STATE], argument, input, lifetime, &report);
-        } else {
+        } else if (streq(command, "request-cancel"))
+                r = enrollment_request_cancel(options[STATE], argument, options[REQUEST_ID]);
+        else {
                 r = enrollment_request_consume(options[STATE], argument, options[REQUEST_ID], &enrollment, &request);
                 if (r >= 0)
                         r = read_attestation_file(options[TOKEN], ATTESTATION_TOKEN_SIZE_MAX, &text);
@@ -617,7 +621,7 @@ finish:
                         r = enrollment_request_validate(enrollment);
                 if (r >= 0 && fputs(output, stdout) == EOF)
                         r = -EIO;
-        } else if (r >= 0)
+        } else if (r >= 0 && !streq(command, "request-cancel"))
                 r = sd_json_variant_dump(report, SD_JSON_FORMAT_PRETTY | SD_JSON_FORMAT_NEWLINE, stdout, NULL);
         if (r >= 0 && fflush(stdout) != 0)
                 r = -EIO;
@@ -1094,6 +1098,7 @@ static void usage(void) {
                "  trustctl enrollment-status KEY --state-dir=DIR\n"
                "  trustctl enrollment-revoke KEY --state-dir=DIR\n"
                "  trustctl request-begin KEY --state-dir=DIR --request=FILE --lifetime=SECONDS\n"
+               "  trustctl request-cancel KEY --state-dir=DIR --request-id=HEX\n"
                "  trustctl request-complete KEY --state-dir=DIR --request-id=HEX --token=FILE --reference=FILE --phase=STRING --allow-root-declared-authentication\n"
                "  trustctl activate-credential <cred> <secret>  Answer a MakeCredential challenge\n"
                "  trustctl list-sessions            All tracked logind sessions\n"
@@ -1137,7 +1142,7 @@ int main(int argc, char *argv[]) {
                 return cmd_appraise_attestation(argc - 2, argv + 2);
         if (streq(cmd, "verify-endorsement") || streq(cmd, "enrollment-begin") || streq(cmd, "enrollment-complete") ||
             streq(cmd, "enrollment-status") || streq(cmd, "enrollment-revoke") ||
-            streq(cmd, "request-begin") || streq(cmd, "request-complete"))
+            streq(cmd, "request-begin") || streq(cmd, "request-cancel") || streq(cmd, "request-complete"))
                 return cmd_enrollment(cmd, argc - 2, argv + 2);
         if (streq(cmd, "enroll"))
                 return cmd_enroll();

@@ -26,6 +26,7 @@ void enrollment_release(Enrollment *enrollment);
 
 int enrollment_request_begin(const char *state_dir, const char *key_id, sd_json_variant *context,
                              uint64_t lifetime_sec, sd_json_variant **ret_request);
+int enrollment_request_cancel(const char *state_dir, const char *key_id, const char *request_id);
 /* A matching request is durably consumed before returning. The exclusive enrollment lock must
  * remain held through appraisal. Consumption alone does not establish authentication. */
 int enrollment_request_consume(const char *state_dir, const char *key_id, const char *request_id,

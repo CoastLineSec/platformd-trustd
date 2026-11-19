@@ -341,6 +341,17 @@
       </varlistentry>
 
       <varlistentry>
+        <term><command>request-cancel</command> <replaceable>KEY</replaceable>
+        <option>--state-dir=<replaceable>DIR</replaceable></option>
+        <option>--request-id=<replaceable>HEX</replaceable></option></term>
+        <listitem><para>Remove the matching authentication request from an active
+        enrollment without appraising evidence. No output is written on success,
+        including when no request is pending. A different request identifier
+        fails without changing the current request. A cancelled request cannot
+        be completed.</para></listitem>
+      </varlistentry>
+
+      <varlistentry>
         <term><command>request-complete</command> <replaceable>KEY</replaceable>
         <option>--state-dir=<replaceable>DIR</replaceable></option>
         <option>--request-id=<replaceable>HEX</replaceable></option>

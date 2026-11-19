@@ -653,6 +653,77 @@ static void test_requests(TestIdentity *identity) {
         assertions += 14;
 }
 
+static void assert_generation(const char *directory, const char *key_id, uint64_t expected) {
+        sd_json_variant *status = NULL;
+        uint64_t generation;
+
+        assert(enrollment_status(directory, key_id, &status) == 0);
+        assert(unsigned_field(status, "generation", &generation) && generation == expected);
+        sd_json_variant_unref(status);
+}
+
+static void test_request_cancel(TestIdentity *identity) {
+        static const char other[] = "0000000000000000000000000000000000000000000000000000000000000000";
+        const uint64_t created = UINT64_C(100000000);
+        sd_json_variant *context = context_make(), *request = NULL, *next = NULL, *inner = NULL;
+        char *directory = directory_make();
+        Enrollment *e = NULL;
+        const char *id, *next_id;
+
+        assert(enrollment_request_cancel(directory, identity->id, other) == -ENOENT);
+        activate(directory, identity);
+        assert(enrollment_request_cancel(directory, "bad-key", other) == -EINVAL);
+        assert(enrollment_request_cancel(directory, identity->id, "bad-request") == -EINVAL);
+        assert(enrollment_request_cancel(directory, identity->id, other) == 0);
+        assert_generation(directory, identity->id, 2);
+
+        fixed_boottime_usec = created;
+        assert(enrollment_request_begin(directory, identity->id, context, 60, &request) == 0);
+        id = string_field(request, "requestId");
+        assert(enrollment_request_cancel(directory, identity->id, other) == -ESTALE);
+        assert_generation(directory, identity->id, 3);
+        assert(enrollment_acquire(directory, identity->id, &e) == 0);
+        assert(enrollment_request_cancel(directory, identity->id, id) == -EBUSY);
+        enrollment_release(e);
+        e = NULL;
+
+        sync_count = 0;
+        fail_sync = 1;
+        assert(enrollment_request_cancel(directory, identity->id, id) == -EIO);
+        fail_sync = 0;
+        assert_generation(directory, identity->id, 3);
+        assert(enrollment_request_begin(directory, identity->id, context, 60, &next) == -EALREADY && !next);
+
+        sync_count = 0;
+        fail_clock = true;
+        assert(enrollment_request_cancel(directory, identity->id, id) == 0);
+        fail_clock = false;
+        assert(sync_count == 2);
+        assert_generation(directory, identity->id, 4);
+        assert(enrollment_request_cancel(directory, identity->id, id) == 0);
+        assert_generation(directory, identity->id, 4);
+        assert(enrollment_request_consume(directory, identity->id, id, &e, &inner) == -ENODATA && !e && !inner);
+        assert(enrollment_request_begin(directory, identity->id, context, 60, &next) == 0);
+        next_id = string_field(next, "requestId");
+        assert(next_id && !streq(next_id, id));
+        assert(enrollment_request_cancel(directory, identity->id, id) == -ESTALE);
+        assert(enrollment_request_consume(directory, identity->id, id, &e, &inner) == -ESTALE && !e && !inner);
+        assert_generation(directory, identity->id, 5);
+
+        fixed_boottime_usec = created + 60 * UINT64_C(1000000);
+        assert(enrollment_request_cancel(directory, identity->id, next_id) == 0);
+        assert_generation(directory, identity->id, 6);
+        fixed_boottime_usec = 0;
+        assert(enrollment_revoke(directory, identity->id, &inner) == 0);
+        assert(enrollment_request_cancel(directory, identity->id, next_id) == -EKEYREVOKED);
+        sd_json_variant_unref(inner);
+        sd_json_variant_unref(next);
+        sd_json_variant_unref(request);
+        sd_json_variant_unref(context);
+        directory_remove(directory);
+        assertions += 24;
+}
+
 static void test_request_expiry(TestIdentity *identity) {
         for (int mode = 0; mode < 4; mode++) {
                 char *directory = directory_make();
@@ -795,7 +866,7 @@ static void test_consumed_request_expiry(TestIdentity *identity) {
 }
 
 static void test_request_concurrency(TestIdentity *identity) {
-        for (int mode = 0; mode < 3; mode++) {
+        for (int mode = 0; mode < 4; mode++) {
                 char *directory = directory_make();
                 sd_json_variant *context = context_make(), *request = NULL;
                 int gate[2], successes = 0;
@@ -821,6 +892,8 @@ static void test_request_concurrency(TestIdentity *identity) {
                                         r = enrollment_request_begin(directory, identity->id, context, 60, &result);
                                 else if (mode == 2 && i == 1)
                                         r = enrollment_revoke(directory, identity->id, &result);
+                                else if (mode == 3 && i == 1)
+                                        r = enrollment_request_cancel(directory, identity->id, string_field(request, "requestId"));
                                 else
                                         r = enrollment_request_consume(directory, identity->id, string_field(request, "requestId"), &e, &result);
                                 enrollment_release(e);
@@ -838,7 +911,15 @@ static void test_request_concurrency(TestIdentity *identity) {
                         assert(WIFEXITED(status) && WEXITSTATUS(status) <= 1);
                         successes += WEXITSTATUS(status) == 0;
                 }
-                assert(successes >= 1 && (mode == 2 || successes == 1));
+                assert(successes >= 1 && (mode >= 2 || successes == 1));
+                if (mode == 3) {
+                        Enrollment *e = NULL;
+                        sd_json_variant *result = NULL;
+
+                        assert_generation(directory, identity->id, 4);
+                        assert(enrollment_request_consume(directory, identity->id, string_field(request, "requestId"),
+                                                          &e, &result) == -ENODATA && !e && !result);
+                }
                 sd_json_variant_unref(context);
                 sd_json_variant_unref(request);
                 directory_remove(directory);
@@ -914,6 +995,7 @@ int main(void) {
         test_failures(&identity);
         test_concurrency(&identity);
         test_requests(&identity);
+        test_request_cancel(&identity);
         test_request_expiry(&identity);
         test_request_failures(&identity);
         test_consumed_request_expiry(&identity);

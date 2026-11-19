@@ -297,7 +297,10 @@ static sd_json_variant *run(Fixture *f, const char *command, char *const argumen
         assert(!strstr(err, RESPONSE));
         if (success) {
                 assert(!*err);
-                v = parse(text);
+                if (streq(command, "request-cancel"))
+                        assert(!*text);
+                else
+                        v = parse(text);
         } else {
                 assert(!*text && *err);
                 assert(!strstr(err, "Sanitizer"));
@@ -596,6 +599,58 @@ static void test_request_expiry(Fixture *f) {
         }
 }
 
+static void test_request_cancel(Fixture *f) {
+        char *cancel_args[] = { f->id, f->state_option, (char *) "--request-id=" CHALLENGE, NULL };
+        char *begin_args[] = { f->id, f->state_option, f->request_option, (char *) "--lifetime=600", NULL };
+        char *complete_args[] = { f->id, f->state_option, (char *) "--request-id=" CHALLENGE,
+                                  f->token_option, f->reference_option, (char *) "--phase=" PHASE,
+                                  (char *) "--allow-root-declared-authentication", NULL };
+        char *status_args[] = { f->id, f->state_option, NULL };
+        char option[sizeof "--request-id=" CHALLENGE], *before;
+        sd_json_variant *v;
+
+        write_record(f, false, true);
+        test_options(f, "request-cancel", cancel_args);
+        before = read_file(f->record);
+        cancel_args[2] = (char *) "--request-id=" OPERATION;
+        reject(f, "request-cancel", cancel_args);
+        cancel_args[2] = (char *) "--request-id=invalid";
+        reject(f, "request-cancel", cancel_args);
+        unchanged(f, before);
+        free(before);
+
+        cancel_args[2] = (char *) "--request-id=" CHALLENGE;
+        assert(!run(f, "request-cancel", cancel_args, true));
+        before = read_file(f->record);
+        v = parse(before);
+        assert(juint(v, "generation") == 2);
+        assert(sd_json_variant_is_null(sd_json_variant_by_key(v, "request")));
+        sd_json_variant_unref(v);
+        assert(!run(f, "request-cancel", cancel_args, true));
+        reject(f, "request-complete", complete_args);
+        unchanged(f, before);
+        free(before);
+
+        v = run(f, "request-begin", begin_args, true);
+        assert(!streq(jstr(v, "requestId"), CHALLENGE));
+        assert(snprintf(option, sizeof option, "--request-id=%s", jstr(v, "requestId")) == (int) sizeof option - 1);
+        sd_json_variant_unref(v);
+        before = read_file(f->record);
+        reject(f, "request-cancel", cancel_args);
+        reject(f, "request-complete", complete_args);
+        unchanged(f, before);
+        free(before);
+
+        cancel_args[2] = option;
+        assert(!run(f, "request-cancel", cancel_args, true));
+        v = run(f, "enrollment-revoke", status_args, true);
+        sd_json_variant_unref(v);
+        before = read_file(f->record);
+        reject(f, "request-cancel", cancel_args);
+        unchanged(f, before);
+        free(before);
+}
+
 static void test_missing_state(Fixture *f) {
         char option[PATH_MAX + 32];
         char *status_args[] = { f->id, option, NULL };
@@ -702,6 +757,7 @@ int main(int argc, char **argv) {
         test_requests(&f);
         test_request_expiry(&f);
         test_request_files(&f);
+        test_request_cancel(&f);
         test_missing_state(&f);
 
         free(f.ak);
